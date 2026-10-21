@@ -340,10 +340,10 @@ async function initStreams() {
   stopped = false;
   try {
     const { rows } = await db.query(
-      `SELECT u.id, w.public_key
+      `SELECT DISTINCT u.id, w.public_key
        FROM users u
        JOIN wallets w ON w.user_id = u.id
-       WHERE u.push_subscription IS NOT NULL`
+       JOIN push_subscriptions ps ON ps.user_id = u.id AND ps.active = true`
     );
     for (const row of rows) pushTargets.set(row.public_key, row.id);
     logger.info('Ledger listener initialized', { pushTargets: rows.length });
