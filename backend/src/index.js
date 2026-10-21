@@ -42,6 +42,7 @@ const jwt = require('jsonwebtoken');
 const { startScheduler, stopScheduler } = require('./scheduler');
 const { setSocketIO } = require('./services/notificationInbox');
 const { isJtiBlacklisted } = require('./controllers/sessionController');
+const socketRegistry = require('./services/socketRegistry');
 
 const PORT = process.env.PORT || 5000;
 const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -102,6 +103,8 @@ io.use(async (socket, next) => {
     }
     
     socket.userId = payload.userId;
+    socket.data.jti = payload.jti;
+    socket.data.exp = payload.exp;
     next();
   } catch {
     next(new Error('Invalid token'));
@@ -109,6 +112,12 @@ io.use(async (socket, next) => {
 });
 
 io.on('connection', async (socket) => {
+  socket.join(socketRegistry.userRoom(socket.userId));
+  // Force reconnect with a fresh token once the access token expires (#1302)
+  const expiryTimer = socket.data.exp
+    ? setTimeout(() => socket.disconnect(true), Math.min(2 ** 31 - 1, Math.max(0, socket.data.exp * 1000 - Date.now())))
+    : null;
+
   try {
     const { rows } = await db.query(
       `SELECT w.public_key FROM wallets w WHERE w.user_id = $1`,
@@ -128,6 +137,7 @@ io.on('connection', async (socket) => {
   }
 
   socket.on('disconnect', () => {
+    if (expiryTimer) clearTimeout(expiryTimer);
     for (const key of socket.walletKeys || []) ledgerListener.releaseAccount(key);
     socket.walletKeys = [];
     logger.info('Socket disconnected', { userId: socket.userId });
@@ -136,6 +146,7 @@ io.on('connection', async (socket) => {
 
 ledgerListener.setSocketIO(io);
 setSocketIO(io);
+socketRegistry.setSocketIO(io);
 
 let shuttingDown = false;
 

@@ -5,6 +5,7 @@ const { withRetry, retryWithBackoff } = require('../utils/retry');
 const { withTimeout } = require('../utils/withTimeout');
 const { enqueue } = require('../utils/txQueue');
 const { checkMemoRequired } = require('./memoRequired');
+const { getRpc: getSorobanRpc, waitForSorobanTx } = require('../config/soroban');
 const {
   AccountResponseSchema,
   TransactionSubmitResponseSchema,
@@ -1559,9 +1560,6 @@ async function getAssetMetadataByCodeAndIssuer(code, issuer) {
 // ---------------------------------------------------------------------------
 
 const MULTISIG_APPROVAL_CONTRACT_ID = process.env.MULTISIG_APPROVAL_CONTRACT_ID;
-const sorobanRpcUrl = process.env.SOROBAN_RPC_URL || (isTestnet
-  ? 'https://soroban-testnet.stellar.org'
-  : 'https://mainnet.soroban.stellar.org');
 const SOROBAN_CONFIRMATION_TIMEOUT_MS = parseInt(process.env.SOROBAN_CONFIRMATION_TIMEOUT_MS || '30000', 10);
 
 async function initMultisigApproval({ publicKey, encryptedSecretKey }) {
@@ -1573,7 +1571,7 @@ async function initMultisigApproval({ publicKey, encryptedSecretKey }) {
 
   const secretKey = decryptPrivateKey(encryptedSecretKey);
   const keypair = StellarSdk.Keypair.fromSecret(secretKey);
-  const rpc = new StellarSdk.SorobanRpc.Server(sorobanRpcUrl);
+  const rpc = getSorobanRpc();
   const account = await rpc.getAccount(publicKey);
   const contract = new StellarSdk.Contract(MULTISIG_APPROVAL_CONTRACT_ID);
 
@@ -1602,17 +1600,7 @@ async function initMultisigApproval({ publicKey, encryptedSecretKey }) {
     throw Object.assign(new Error(`register_business failed: ${result.errorResult}`), { status: 400 });
   }
 
-  const maxIterations = Math.ceil(SOROBAN_CONFIRMATION_TIMEOUT_MS / 1000);
-  let response = result;
-  let iterations = 0;
-  while (response.status === 'PENDING' || response.status === 'NOT_FOUND') {
-    if (iterations >= maxIterations) {
-      throw Object.assign(new Error('Multisig approval confirmation timeout'), { status: 504 });
-    }
-    await new Promise((r) => setTimeout(r, 1000));
-    response = await rpc.getTransaction(result.hash);
-    iterations++;
-  }
+  const response = await waitForSorobanTx(rpc, result, { timeoutMs: SOROBAN_CONFIRMATION_TIMEOUT_MS });
 
   if (response.status !== 'SUCCESS') {
     throw Object.assign(new Error(`Multisig approval transaction failed: ${response.status}`), { status: 400 });
