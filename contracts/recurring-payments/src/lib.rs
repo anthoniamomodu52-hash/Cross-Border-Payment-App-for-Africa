@@ -37,8 +37,11 @@ pub type IntervalSecs = u64;
 #[contracttype]
 pub enum ScheduleStatus {
     Active,
+    /// Stopped by the sender, or auto-cancelled after too many missed windows.
     Cancelled,
     Paused,
+    /// Finished successfully: all `max_executions` payments were made.
+    Completed,
 }
 
 #[derive(Clone)]
@@ -146,6 +149,16 @@ pub struct PaymentMissed {
     pub newly_missed: u64,
     /// Total consecutive misses recorded for this schedule after this event.
     pub total_missed: u64,
+}
+
+/// Emitted when a bounded schedule makes its final payment and becomes
+/// `Completed`.
+#[derive(Clone)]
+#[contracttype]
+pub struct ScheduleCompleted {
+    pub schedule_id: u64,
+    pub executions_completed: u64,
+    pub completed_at: u64,
 }
 
 /// Emitted when a schedule is cancelled automatically because it reached
@@ -492,9 +505,12 @@ impl RecurringPaymentsContract {
         schedule.next_payment_at = now + schedule.interval;
         schedule.executions_completed += 1;
 
-        // Cancel schedule if max executions reached
-        if schedule.max_executions > 0 && schedule.executions_completed >= schedule.max_executions {
-            schedule.status = ScheduleStatus::Cancelled;
+        // A bounded schedule that has made all its payments is Completed,
+        // not Cancelled, so clients can tell success from cancellation.
+        let completed = schedule.max_executions > 0
+            && schedule.executions_completed >= schedule.max_executions;
+        if completed {
+            schedule.status = ScheduleStatus::Completed;
         }
 
         env.storage()
@@ -511,6 +527,17 @@ impl RecurringPaymentsContract {
                 executions_completed: schedule.executions_completed,
             },
         );
+
+        if completed {
+            env.events().publish(
+                (Symbol::new(&env, "ScheduleCompleted"),),
+                ScheduleCompleted {
+                    schedule_id,
+                    executions_completed: schedule.executions_completed,
+                    completed_at: now,
+                },
+            );
+        }
     }
 
     /// Cancel a recurring schedule. Only the original sender may cancel.
@@ -529,6 +556,9 @@ impl RecurringPaymentsContract {
         }
         if schedule.status == ScheduleStatus::Cancelled {
             panic!("schedule is already cancelled");
+        }
+        if schedule.status == ScheduleStatus::Completed {
+            panic!("schedule is already completed");
         }
 
         schedule.status = ScheduleStatus::Cancelled;
@@ -658,6 +688,9 @@ impl RecurringPaymentsContract {
         if schedule.status == ScheduleStatus::Cancelled {
             panic!("cannot update cancelled schedule");
         }
+        if schedule.status == ScheduleStatus::Completed {
+            panic!("cannot update completed schedule");
+        }
 
         let old_amount = schedule.amount;
         schedule.amount = new_amount;
@@ -701,6 +734,9 @@ impl RecurringPaymentsContract {
         }
         if schedule.status == ScheduleStatus::Cancelled {
             panic!("cannot update cancelled schedule");
+        }
+        if schedule.status == ScheduleStatus::Completed {
+            panic!("cannot update completed schedule");
         }
 
         let old_recipient = schedule.recipient.clone();

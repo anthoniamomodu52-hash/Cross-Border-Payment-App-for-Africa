@@ -412,7 +412,7 @@ fn test_cancel_paused_schedule() {
 // ── #551: max_executions ──────────────────────────────────────────────────────
 
 #[test]
-fn test_max_executions_auto_cancels_schedule() {
+fn test_max_executions_marks_schedule_completed() {
     let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
     // grace_period_secs=3600, max_missed_executions=3 (defaults)
@@ -426,8 +426,50 @@ fn test_max_executions_auto_cancels_schedule() {
 
     advance_time(&env, 86400);
     client.execute_payment(&executor, &id);
-    assert_eq!(client.get_recurring_payment(&id).status, ScheduleStatus::Cancelled);
+    assert_eq!(count_events(&env, &contract_id, "ScheduleCompleted"), 1);
+    // Finished successfully: Completed, not Cancelled.
+    assert_eq!(client.get_recurring_payment(&id).status, ScheduleStatus::Completed);
     assert_eq!(client.get_recurring_payment(&id).executions_completed, 2);
+    assert_eq!(client.get_remaining_executions(&id), Some(0));
+    assert!(client.get_active_schedules(&0, &50).is_empty());
+}
+
+#[test]
+fn test_non_final_execution_does_not_emit_completed() {
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    let id = client.create_recurring_payment(
+        &sender, &recipient, &token_id, &100_0000000, &86400, &2, &3600, &3,
+    );
+    advance_time(&env, 86400);
+    client.execute_payment(&executor, &id);
+    assert_eq!(count_events(&env, &contract_id, "ScheduleCompleted"), 0);
+}
+
+#[test]
+#[should_panic(expected = "schedule is already completed")]
+fn test_cancel_completed_schedule_panics() {
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    let id = client.create_recurring_payment(
+        &sender, &recipient, &token_id, &100_0000000, &86400, &1, &3600, &3,
+    );
+    advance_time(&env, 86400);
+    client.execute_payment(&executor, &id);
+    client.cancel_recurring_payment(&sender, &id);
+}
+
+#[test]
+#[should_panic(expected = "cannot update completed schedule")]
+fn test_update_amount_on_completed_schedule_panics() {
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    let id = client.create_recurring_payment(
+        &sender, &recipient, &token_id, &100_0000000, &86400, &1, &3600, &3,
+    );
+    advance_time(&env, 86400);
+    client.execute_payment(&executor, &id);
+    client.update_amount(&sender, &id, &200_0000000);
 }
 
 #[test]
@@ -441,7 +483,7 @@ fn test_execute_payment_after_max_executions_panics() {
 
     advance_time(&env, 86400);
     client.execute_payment(&executor, &id);
-    // schedule is now Cancelled — next call must panic
+    // schedule is now Completed — next call must panic
     advance_time(&env, 86400);
     client.execute_payment(&executor, &id);
 }

@@ -21,14 +21,20 @@ A Soroban smart contract that lets users authorize on-chain recurring transfers 
 ## Schedule lifecycle
 
 ```
-authorize_recurring → Active
-                         │
-          ┌──────────────┴──────────────┐
-          │                             │
-   execute_payment               cancel_recurring
-   (repeats each interval)            │
-                                  Cancelled
+create_recurring_payment → Active ⇄ Paused (pause / resume)
+                             │
+     ┌───────────────────────┼──────────────────────────────┐
+     │                       │                              │
+ final payment of     cancel_recurring_payment     max_missed_executions
+ max_executions             (sender)                 reached (auto)
+     │                       │                              │
+ Completed               Cancelled                      Cancelled
+ (ScheduleCompleted)     (ScheduleCancelled)    (ScheduleAutoCancelled)
 ```
+
+`Completed` means the plan finished successfully; `Cancelled` means it was
+stopped early. The event tells a user cancel apart from an auto-cancel.
+Completed schedules cannot be cancelled or updated.
 
 ## Missed payments
 
@@ -77,4 +83,4 @@ The backend scheduled-payments service should:
 
 1. Watch for `ScheduleAuthorized` events to track active schedules.
 2. Call `execute_payment` when `next_payment_at <= now` (can be incentivized with a small tip).
-3. Watch for `ScheduleCancelled` events to stop tracking a schedule.
+3. Watch for `ScheduleCompleted`, `ScheduleCancelled` and `ScheduleAutoCancelled` events to stop tracking a schedule.
