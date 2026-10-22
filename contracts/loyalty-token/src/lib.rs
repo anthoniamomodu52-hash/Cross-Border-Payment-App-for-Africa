@@ -3,26 +3,58 @@
 //! # AfriPay Loyalty Token — SEP-41 Compatible Fungible Token
 //!
 //! Issues loyalty points to users for each transaction and allows redemption
-//! for fee discounts.
+//! for fee discounts via a configurable tiered system.
 //!
 //! ## Earn rate
 //! 1 loyalty point per 1 XLM (or XLM-equivalent) of transaction volume.
 //! The backend calls [`mint`] after each successful payment.
 //!
+//! ## Tiers (defaults)
+//! | Index | Threshold | Discount |
+//! |-------|-----------|----------|
+//! |   0   |    50 pts |    10 %  |
+//! |   1   |   100 pts |    25 %  |
+//! |   2   |   500 pts |    50 %  |
+//! |   3   |  1000 pts |    75 %  |
+//!
 //! ## Redemption
-//! 100 points → 50 % fee discount on the next transaction.
-//! The backend calls [`redeem`] before a payment to burn 100 points and
-//! record the discount entitlement on-chain.
+//! Call [`redeem`] with a `tier_index` to burn that tier's threshold points
+//! and record the discount entitlement. The backend calls [`get_discount`]
+//! to determine the highest tier the user qualifies for without burning tokens.
 //!
 //! ## SEP-41 interface
-//! Implements the full SEP-41 token interface:
+//! Implements the SEP-41 token interface:
 //! `allowance`, `approve`, `balance`, `burn`, `burn_from`,
 //! `decimals`, `mint`, `name`, `symbol`, `total_supply`,
 //! `transfer`, `transfer_from`.
+//!
+//! Every state-changing function emits the SEP-41-shaped events
+//! (`transfer`, `mint`, `burn`, `approve`) via `env.events().publish(...)` so
+//! wallets, explorers and indexers can reconstruct balances from chain data.
+//! `redeem` additionally emits a `redeem` event recording the burned amount
+//! and the awarded discount.
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, String,
+    contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, String, Symbol,
+    Vec,
 };
+
+// ── KYC Tier enum ────────────────────────────────────────────────────────────────
+// Replicated from kyc-attestation contract for type safety in cross-contract calls.
+#[derive(Clone, Copy)]
+#[contracttype]
+#[repr(u32)]
+pub enum KycTier {
+    Basic = 0,
+    Enhanced = 1,
+    Business = 2,
+}
+
+#[contracttype]
+pub struct AllowanceValue {
+    pub amount: i128,
+    pub expires_at: u64,
+}
 
 mod test;
 
@@ -32,14 +64,43 @@ mod test;
 pub enum DataKey {
     Admin,
     TotalSupply,
+    MaxSupply,
     Balance(Address),
     Allowance(Address, Address), // (owner, spender)
+    KycContractAddress,
+    /// Snapshot counter used to assign the next snapshot id.
+    SnapshotCounter,
+    /// Number of active snapshots currently stored.
+    SnapshotCount,
+    /// Ledger sequence at which a snapshot was taken.
+    SnapshotLedger(u32),
+    /// Per-account checkpoint history: `Vec<(ledger, balance)>` written lazily
+    /// on every balance change. Used to reconstruct historical balances without
+    /// iterating over all holders.
+    Checkpoints(Address),
+    /// Maps a tier index (0–4) to its Tier configuration.
+    Tier(u32),
+}
+
+// ── Tier type ─────────────────────────────────────────────────────────────────
+
+/// A single redemption tier: points required and the fee-discount awarded.
+#[derive(Clone)]
+#[contracttype]
+pub struct Tier {
+    /// Points the user must hold (and will burn) to redeem this tier.
+    pub threshold: i128,
+    /// Fee discount in basis points (e.g. 2500 = 25 %). Max 9000 (90 %).
+    pub discount_bps: u32,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Points required to earn a 50 % fee discount.
-const REDEMPTION_THRESHOLD: i128 = 100;
+/// Maximum number of tiers supported (indices 0 – 4).
+const MAX_TIERS: u32 = 5;
+
+/// Hard cap on discount_bps to prevent 100 % fee waivers.
+const MAX_DISCOUNT_BPS: u32 = 9_000;
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
@@ -52,14 +113,45 @@ impl LoyaltyTokenContract {
 
     /// Initialise the contract. Must be called once before any other function.
     ///
+    /// Sets up four default tiers:
+    /// * Tier 0 — 50 pts → 10 % discount (1 000 bps)
+    /// * Tier 1 — 100 pts → 25 % discount (2 500 bps)
+    /// * Tier 2 — 500 pts → 50 % discount (5 000 bps)
+    /// * Tier 3 — 1 000 pts → 75 % discount (7 500 bps)
+    ///
     /// # Arguments
-    /// * `admin` — Address authorised to mint tokens (the AfriPay backend).
-    pub fn initialize(env: Env, admin: Address) {
+    /// * `admin`      — Address authorised to mint tokens (the AfriPay backend).
+    /// * `max_supply` — Hard ceiling on total points that can ever be minted (must be > 0).
+    pub fn initialize(env: Env, admin: Address, max_supply: i128) {
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("already initialized");
         }
+        if max_supply <= 0 {
+            panic!("max_supply must be positive");
+        }
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::TotalSupply, &0i128);
+        env.storage().persistent().set(&DataKey::MaxSupply, &max_supply);
+        env.storage().persistent().set(&DataKey::SnapshotCounter, &0u32);
+        env.storage().persistent().set(&DataKey::SnapshotCount, &0u32);
+
+        // Install default tiers.
+        env.storage().persistent().set(
+            &DataKey::Tier(0),
+            &Tier { threshold: 50, discount_bps: 1_000 },
+        );
+        env.storage().persistent().set(
+            &DataKey::Tier(1),
+            &Tier { threshold: 100, discount_bps: 2_500 },
+        );
+        env.storage().persistent().set(
+            &DataKey::Tier(2),
+            &Tier { threshold: 500, discount_bps: 5_000 },
+        );
+        env.storage().persistent().set(
+            &DataKey::Tier(3),
+            &Tier { threshold: 1_000, discount_bps: 7_500 },
+        );
     }
 
     // ── SEP-41: token metadata ────────────────────────────────────────────────
@@ -86,6 +178,13 @@ impl LoyaltyTokenContract {
             .unwrap_or(0)
     }
 
+    pub fn max_supply(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaxSupply)
+            .expect("not initialized")
+    }
+
     pub fn balance(env: Env, account: Address) -> i128 {
         env.storage()
             .persistent()
@@ -93,225 +192,366 @@ impl LoyaltyTokenContract {
             .unwrap_or(0)
     }
 
-    // ── SEP-41: allowances ────────────────────────────────────────────────────
-
-    pub fn allowance(env: Env, owner: Address, spender: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Allowance(owner, spender))
-            .unwrap_or(0)
-    }
-
-    /// Approve `spender` to transfer up to `amount` points on behalf of the
-    /// caller.
-    pub fn approve(env: Env, owner: Address, spender: Address, amount: i128) {
-        if amount < 0 {
-            panic!("amount must be non-negative");
-        }
-        owner.require_auth();
-        env.storage()
-            .persistent()
-            .set(&DataKey::Allowance(owner, spender), &amount);
-    }
-
-    // ── SEP-41: transfers ─────────────────────────────────────────────────────
-
-    /// Transfer `amount` points from the caller to `to`.
-    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
-        if amount <= 0 {
-            panic!("amount must be positive");
-        }
-        from.require_auth();
-        Self::_debit(&env, &from, amount);
-        Self::_credit(&env, &to, amount);
-    }
-
-    /// Transfer `amount` points from `from` to `to` using an allowance.
-    pub fn transfer_from(
-        env: Env,
-        spender: Address,
-        from: Address,
-        to: Address,
-        amount: i128,
-    ) {
-        if amount <= 0 {
-            panic!("amount must be positive");
-        }
-        spender.require_auth();
-
-        let allowance: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Allowance(from.clone(), spender.clone()))
-            .unwrap_or(0);
-
-        if allowance < amount {
-            panic!("insufficient allowance");
-        }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Allowance(from.clone(), spender), &(allowance - amount));
-
-        Self::_debit(&env, &from, amount);
-        Self::_credit(&env, &to, amount);
-    }
-
-    // ── SEP-41: burn ──────────────────────────────────────────────────────────
-
-    /// Burn `amount` points from the caller's balance.
-    pub fn burn(env: Env, from: Address, amount: i128) {
-        if amount <= 0 {
-            panic!("amount must be positive");
-        }
-        from.require_auth();
-        Self::_debit(&env, &from, amount);
-        let supply: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TotalSupply)
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::TotalSupply, &(supply - amount));
-    }
-
-    /// Burn `amount` points from `from` using an allowance granted to the
-    /// caller.
-    pub fn burn_from(env: Env, spender: Address, from: Address, amount: i128) {
-        if amount <= 0 {
-            panic!("amount must be positive");
-        }
-        spender.require_auth();
-
-        let allowance: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Allowance(from.clone(), spender.clone()))
-            .unwrap_or(0);
-
-        if allowance < amount {
-            panic!("insufficient allowance");
-        }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Allowance(from.clone(), spender), &(allowance - amount));
-
-        Self::_debit(&env, &from, amount);
-        let supply: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TotalSupply)
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::TotalSupply, &(supply - amount));
-    }
-
-    // ── Loyalty-specific ──────────────────────────────────────────────────────
-
-    /// Mint `amount` loyalty points to `to`.
+    /// Create a snapshot checkpoint. Admin only. Returns the generated snapshot id.
     ///
-    /// Only the admin (AfriPay backend) may call this.
-    /// Called after each successful payment: 1 point per 1 XLM of volume.
-    ///
-    /// # Arguments
-    /// * `admin`  — Must match the admin set during `initialize`.
-    /// * `to`     — Recipient wallet address.
-    /// * `amount` — Points to mint (must be > 0).
-    pub fn mint(env: Env, admin: Address, to: Address, amount: i128) {
-        if amount <= 0 {
-            panic!("amount must be positive");
-        }
+    /// Snapshots no longer iterate over all holders. Instead, the ledger sequence
+    /// is recorded and per-account balances are reconstructed lazily from the
+    /// checkpoint history written on every balance change (see [`snapshot_balance`]).
+    pub fn create_snapshot(env: Env, admin: Address) -> u32 {
         admin.require_auth();
 
-        let stored_admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .expect("not initialized");
-
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
         if admin != stored_admin {
             panic!("unauthorized: caller is not admin");
         }
 
-        Self::_credit(&env, &to, amount);
-
-        let supply: i128 = env
+        let active_count: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::TotalSupply)
+            .get(&DataKey::SnapshotCount)
             .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::TotalSupply, &(supply + amount));
-    }
-
-    /// Redeem 100 loyalty points for a 50 % fee discount on the next
-    /// transaction.
-    ///
-    /// Burns exactly `REDEMPTION_THRESHOLD` (100) points from the caller's
-    /// balance. Returns `true` if the redemption succeeded.
-    ///
-    /// The backend checks the return value and applies the discount before
-    /// broadcasting the next payment.
-    ///
-    /// # Arguments
-    /// * `account` — The user redeeming points; must authorise this call.
-    pub fn redeem(env: Env, account: Address) -> bool {
-        account.require_auth();
-
-        let bal: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Balance(account.clone()))
-            .unwrap_or(0);
-
-        if bal < REDEMPTION_THRESHOLD {
-            return false;
+        if active_count >= 10 {
+            panic!("Snapshot limit reached");
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(account), &(bal - REDEMPTION_THRESHOLD));
-
-        let supply: i128 = env
+        let snapshot_id: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::TotalSupply)
-            .unwrap_or(0);
+            .get(&DataKey::SnapshotCounter)
+            .unwrap_or(0)
+            + 1;
+        env.storage().persistent().set(&DataKey::SnapshotCounter, &snapshot_id);
         env.storage()
             .persistent()
-            .set(&DataKey::TotalSupply, &(supply - REDEMPTION_THRESHOLD));
+            .set(&DataKey::SnapshotCount, &(active_count + 1));
+        env.storage()
+            .persistent()
+            .set(&DataKey::SnapshotLedger(snapshot_id), &env.ledger().sequence());
 
-        true
+        snapshot_id
+    }
+
+    /// Return the balance recorded for a holder at the specified snapshot.
+    ///
+    /// Reconstructed from the per-account checkpoint history: the balance is the
+    /// value of the latest checkpoint at or before the snapshot's ledger. Returns
+    /// 0 when the account had no balance at that ledger.
+    pub fn snapshot_balance(env: Env, snapshot_id: u32, account: Address) -> i128 {
+        let ledger: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SnapshotLedger(snapshot_id))
+            .expect("unknown snapshot");
+
+        let checkpoints: Vec<(u32, i128)> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Checkpoints(account))
+            .unwrap_or(Vec::new(&env));
+
+        let mut balance: i128 = 0;
+        for (cp_ledger, cp_balance) in checkpoints.iter() {
+            if cp_ledger <= ledger {
+                balance = cp_balance;
+            } else {
+                break;
+            }
+        }
+        balance
+    }
+
+    // ── SEP-41: allowances ────────────────────────────────────────────────────
+
+    pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
+        let key = DataKey::Allowance(from, spender);
+        match env.storage().persistent().get::<DataKey, AllowanceValue>(&key) {
+            Some(a) => {
+                if a.expires_at != 0 && env.ledger().sequence() as u64 > a.expires_at {
+                    0
+                } else {
+                    a.amount
+                }
+            }
+            None => 0,
+        }
+    }
+
+    /// Approve `spender` to spend `amount` of `from`'s tokens until `expiration_ledger`.
+    ///
+    /// Emits the SEP-41 `approve` event with topics `("approve", from, spender)`
+    /// and data `(amount, expiration_ledger)`.
+    pub fn approve(
+        env: Env,
+        from: Address,
+        spender: Address,
+        amount: i128,
+        expiration_ledger: u32,
+    ) {
+        from.require_auth();
+        if amount < 0 {
+            panic!("amount must be non-negative");
+        }
+        let key = DataKey::Allowance(from.clone(), spender.clone());
+        env.storage().persistent().set(
+            &key,
+            &AllowanceValue {
+                amount,
+                expires_at: expiration_ledger as u64,
+            },
+        );
+        env.events().publish(
+            (symbol_short!("approve"), from, spender),
+            (amount, expiration_ledger),
+        );
+    }
+
+    /// Increase the allowance for `spender` by `amount`.
+    ///
+    /// Emits the SEP-41 `approve` event with the resulting allowance.
+    pub fn increase_allowance(
+        env: Env,
+        from: Address,
+        spender: Address,
+        amount: i128,
+        expiration_ledger: u32,
+    ) {
+        from.require_auth();
+        if amount < 0 {
+            panic!("amount must be non-negative");
+        }
+        let key = DataKey::Allowance(from.clone(), spender.clone());
+        let current = Self::allowance(env.clone(), from.clone(), spender.clone());
+        let new_amount = current + amount;
+        env.storage().persistent().set(
+            &key,
+            &AllowanceValue {
+                amount: new_amount,
+                expires_at: expiration_ledger as u64,
+            },
+        );
+        env.events().publish(
+            (symbol_short!("approve"), from, spender),
+            (new_amount, expiration_ledger),
+        );
+    }
+
+    /// Decrease the allowance for `spender` by `amount`.
+    ///
+    /// Emits the SEP-41 `approve` event with the resulting allowance.
+    pub fn decrease_allowance(
+        env: Env,
+        from: Address,
+        spender: Address,
+        amount: i128,
+        expiration_ledger: u32,
+    ) {
+        from.require_auth();
+        if amount < 0 {
+            panic!("amount must be non-negative");
+        }
+        let key = DataKey::Allowance(from.clone(), spender.clone());
+        let current = Self::allowance(env.clone(), from.clone(), spender.clone());
+        let new_amount = if amount > current { 0 } else { current - amount };
+        env.storage().persistent().set(
+            &key,
+            &AllowanceValue {
+                amount: new_amount,
+                expires_at: expiration_ledger as u64,
+            },
+        );
+        env.events().publish(
+            (symbol_short!("approve"), from, spender),
+            (new_amount, expiration_ledger),
+        );
+    }
+
+    // ── SEP-41: transfers ─────────────────────────────────────────────────────
+
+    /// Transfer `amount` from `from` to `to`.
+    ///
+    /// Emits the SEP-41 `transfer` event with topics `("transfer", from, to)`
+    /// and data `amount`.
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        if amount < 0 {
+            panic!("amount must be non-negative");
+        }
+        Self::move_balance(&env, &from, &to, amount);
+        env.events().publish(
+            (symbol_short!("transfer"), from, to),
+            amount,
+        );
+    }
+
+    /// Transfer `amount` from `from` to `to` using `spender`'s allowance.
+    ///
+    /// Emits the SEP-41 `transfer` event with topics `("transfer", from, to)`
+    /// and data `amount`.
+    pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        spender.require_auth();
+        if amount < 0 {
+            panic!("amount must be non-negative");
+        }
+        let key = DataKey::Allowance(from.clone(), spender.clone());
+        let current = Self::allowance(env.clone(), from.clone(), spender.clone());
+        if current < amount {
+            panic!("insufficient allowance");
+        }
+        env.storage().persistent().set(
+            &key,
+            &AllowanceValue {
+                amount: current - amount,
+                expires_at: 0,
+            },
+        );
+        Self::move_balance(&env, &from, &to, amount);
+        env.events().publish(
+            (symbol_short!("transfer"), from, to),
+            amount,
+        );
+    }
+
+    // ── SEP-41: mint / burn ───────────────────────────────────────────────────
+
+    /// Mint `amount` new points to `to`. Admin only.
+    ///
+    /// Emits the SEP-41 `mint` event with topics `("mint", admin, to)` and
+    /// data `amount`.
+    pub fn mint(env: Env, admin: Address, to: Address, amount: i128) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+        if amount < 0 {
+            panic!("amount must be non-negative");
+        }
+        let total: i128 = Self::total_supply(env.clone());
+        let max: i128 = Self::max_supply(env.clone());
+        if total + amount > max {
+            panic!("max supply exceeded");
+        }
+        let balance = Self::balance(env.clone(), to.clone());
+        Self::set_balance(&env, &to, balance + amount);
+        env.storage().persistent().set(&DataKey::TotalSupply, &(total + amount));
+        env.events().publish(
+            (symbol_short!("mint"), admin, to),
+            amount,
+        );
+    }
+
+    /// Burn `amount` from `from`'s own balance.
+    ///
+    /// Emits the SEP-41 `burn` event with topics `("burn", from)` and data `amount`.
+    pub fn burn(env: Env, from: Address, amount: i128) {
+        from.require_auth();
+        if amount < 0 {
+            panic!("amount must be non-negative");
+        }
+        let balance = Self::balance(env.clone(), from.clone());
+        if balance < amount {
+            panic!("insufficient balance");
+        }
+        Self::set_balance(&env, &from, balance - amount);
+        let total: i128 = Self::total_supply(env.clone());
+        env.storage().persistent().set(&DataKey::TotalSupply, &(total - amount));
+        env.events().publish(
+            (symbol_short!("burn"), from),
+            amount,
+        );
+    }
+
+    /// Burn `amount` from `from` using `spender`'s allowance.
+    ///
+    /// Emits the SEP-41 `burn` event with topics `("burn", from)` and data `amount`.
+    pub fn burn_from(env: Env, spender: Address, from: Address, amount: i128) {
+        spender.require_auth();
+        if amount < 0 {
+            panic!("amount must be non-negative");
+        }
+        let key = DataKey::Allowance(from.clone(), spender.clone());
+        let current = Self::allowance(env.clone(), from.clone(), spender.clone());
+        if current < amount {
+            panic!("insufficient allowance");
+        }
+        env.storage().persistent().set(
+            &key,
+            &AllowanceValue {
+                amount: current - amount,
+                expires_at: 0,
+            },
+        );
+        let balance = Self::balance(env.clone(), from.clone());
+        if balance < amount {
+            panic!("insufficient balance");
+        }
+        Self::set_balance(&env, &from, balance - amount);
+        let total: i128 = Self::total_supply(env.clone());
+        env.storage().persistent().set(&DataKey::TotalSupply, &(total - amount));
+        env.events().publish(
+            (symbol_short!("burn"), from),
+            amount,
+        );
+    }
+
+    // ── Redemption ────────────────────────────────────────────────────────────
+
+    /// Redeem a tier: burn the tier's threshold points from `user` and record
+    /// the awarded discount entitlement.
+    ///
+    /// Emits a `redeem` event with topics `("redeem", user)` and data
+    /// `(tier_index, burned, discount_bps)`.
+    pub fn redeem(env: Env, user: Address, tier_index: u32) {
+        user.require_auth();
+        if tier_index >= MAX_TIERS {
+            panic!("invalid tier index");
+        }
+        let tier: Tier = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Tier(tier_index))
+            .expect("tier not configured");
+        let balance = Self::balance(env.clone(), user.clone());
+        if balance < tier.threshold {
+            panic!("insufficient points for tier");
+        }
+        Self::set_balance(&env, &user, balance - tier.threshold);
+        let total: i128 = Self::total_supply(env.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalSupply, &(total - tier.threshold));
+        env.events().publish(
+            (symbol_short!("redeem"), user),
+            (tier_index, tier.threshold, tier.discount_bps),
+        );
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
-    fn _credit(env: &Env, to: &Address, amount: i128) {
-        let bal: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Balance(to.clone()))
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(to.clone()), &(bal + amount));
-    }
-
-    fn _debit(env: &Env, from: &Address, amount: i128) {
-        let bal: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Balance(from.clone()))
-            .unwrap_or(0);
-        if bal < amount {
+    /// Move `amount` from `from` to `to`, updating balances and checkpoints.
+    fn move_balance(env: &Env, from: &Address, to: &Address, amount: i128) {
+        let from_balance = Self::balance(env.clone(), from.clone());
+        if from_balance < amount {
             panic!("insufficient balance");
         }
+        Self::set_balance(env, from, from_balance - amount);
+        let to_balance = Self::balance(env.clone(), to.clone());
+        Self::set_balance(env, to, to_balance + amount);
+    }
+
+    /// Persist a balance and append a checkpoint for historical reconstruction.
+    fn set_balance(env: &Env, account: &Address, balance: i128) {
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(from.clone()), &(bal - amount));
+            .set(&DataKey::Balance(account.clone()), &balance);
+        let mut checkpoints: Vec<(u32, i128)> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Checkpoints(account.clone()))
+            .unwrap_or(Vec::new(env));
+        checkpoints.push_back((env.ledger().sequence(), balance));
+        env.storage()
+            .persistent()
+            .set(&DataKey::Checkpoints(account.clone()), &checkpoints);
     }
 }

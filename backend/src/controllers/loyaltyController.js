@@ -11,7 +11,7 @@
 
 const { v4: uuidv4 } = require("uuid");
 const db = require("../db");
-const { redeemPoints, getBalance } = require("../services/loyaltyToken");
+const { mintPoints, redeemPoints, getBalance } = require("../services/loyaltyToken");
 
 /**
  * GET /api/loyalty/balance
@@ -20,13 +20,17 @@ const { redeemPoints, getBalance } = require("../services/loyaltyToken");
 async function balance(req, res, next) {
   try {
     const walletResult = await db.query(
-      "SELECT public_key FROM wallets WHERE user_id = $1",
+      "SELECT public_key FROM wallets WHERE user_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1",
       [req.user.userId]
     );
     if (!walletResult.rows[0]) {
       return res.status(404).json({ error: "Wallet not found" });
     }
     const { public_key } = walletResult.rows[0];
+
+    if (!process.env.LOYALTY_TOKEN_CONTRACT_ID) {
+      return res.json({ wallet: public_key, points: 0 });
+    }
 
     const points = await getBalance({ walletAddress: public_key });
     res.json({ wallet: public_key, points });
@@ -43,7 +47,7 @@ async function balance(req, res, next) {
 async function redeem(req, res, next) {
   try {
     const walletResult = await db.query(
-      "SELECT public_key, encrypted_secret_key FROM wallets WHERE user_id = $1",
+      "SELECT public_key, encrypted_secret_key FROM wallets WHERE user_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1",
       [req.user.userId]
     );
     if (!walletResult.rows[0]) {
@@ -100,4 +104,39 @@ async function history(req, res, next) {
   }
 }
 
-module.exports = { balance, redeem, history };
+/**
+ * POST /api/loyalty/mint  (internal — admin or service-to-service)
+ * Body: { user_id, points }
+ * Mints loyalty tokens to the given user's wallet and records the event.
+ */
+async function mint(req, res, next) {
+  try {
+    const { user_id, points } = req.body;
+    if (!user_id || !points || points < 1) {
+      return res.status(400).json({ error: 'user_id and positive points are required' });
+    }
+
+    const walletResult = await db.query(
+      'SELECT public_key FROM wallets WHERE user_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1',
+      [user_id],
+    );
+    if (!walletResult.rows[0]) {
+      return res.status(404).json({ error: 'Wallet not found for user' });
+    }
+    const { public_key } = walletResult.rows[0];
+
+    const result = await mintPoints({ recipientWallet: public_key, points });
+
+    await db.query(
+      `INSERT INTO loyalty_points (id, user_id, wallet_address, event_type, points, tx_hash)
+       VALUES ($1, $2, $3, 'mint', $4, $5)`,
+      [uuidv4(), user_id, public_key, points, result?.txHash ?? null],
+    );
+
+    res.json({ minted: true, wallet: public_key, points, tx_hash: result?.txHash ?? null });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { balance, redeem, history, mint };

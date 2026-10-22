@@ -1,19 +1,24 @@
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
 const cookieParser = require('cookie-parser');
 const Sentry = require('@sentry/node');
 
 const requestId = require('./middleware/requestId');
 const metricsMiddleware = require('./middleware/metricsMiddleware');
 const { registry } = require('./utils/metrics');
+const rateLimit = require('express-rate-limit');
+const rateLimiters = require('./middleware/rateLimiter');
+
+const { getHealth: getLedgerHealth } = require('./services/ledgerListener');
 
 const authRoutes = require('./routes/auth');
 const walletRoutes = require('./routes/wallet');
 const paymentRoutes = require('./routes/payments');
 const paymentRequestRoutes = require('./routes/paymentRequests');
 const scheduledPaymentRoutes = require('./routes/scheduledPayments');
+const savingsRoutes = require('./routes/savings');
 const anchorRoutes = require('./routes/anchor');
 const kycRoutes = require('./routes/kyc');
 const adminRoutes = require('./routes/admin');
@@ -35,17 +40,31 @@ const disputeRoutes = require('./routes/disputes');
 const pricesRoutes = require('./routes/prices');
 const channelsRoutes = require('./routes/channels');
 const contractsRoutes = require('./routes/contracts');
+const ledgerRoutes = require('./routes/ledger');
+const contactsRoutes = require('./routes/contacts');
 const ipAllowlist = require('./middleware/ipAllowlist');
+const geoRestriction = require('./middleware/geoRestriction');
 
 const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
+const paymentSendValidators = require('./validators/paymentSendValidators');
 
 const logger = require('./utils/logger');
-const { runHealthChecks } = require('./services/health');
+const { runHealthChecks, runDeepHealthChecks } = require('./services/health');
 
 const app = express();
+const trustedProxies = (process.env.TRUSTED_PROXIES || '').split(',').map((value) => value.trim()).filter(Boolean);
+app.set('trust proxy', trustedProxies.length ? trustedProxies : false);
+
+// Trust the configured number of proxy hops (e.g. TRUST_PROXY=1 behind a single load balancer)
+// so req.ip reflects the real client address for the admin IP allow-list and rate limiting.
+if (process.env.TRUST_PROXY) {
+  const tp = process.env.TRUST_PROXY;
+  app.set('trust proxy', /^\d+$/.test(tp) ? parseInt(tp, 10) : tp === 'true' ? true : tp);
+}
 
 app.use(Sentry.Handlers.requestHandler());
+
 app.use(requestId);
 app.use((req, res, next) => {
   req.logger = logger.child({ requestId: req.requestId });
@@ -53,61 +72,97 @@ app.use((req, res, next) => {
 });
 app.use(metricsMiddleware);
 app.use(cookieParser());
-app.use(helmet({
+app.use((req, res, next) => {
+  res.locals.cspNonce = crypto.randomBytes(16).toString('base64');
+  next();
+});
+
+// Helmet is instantiated once at startup. The per-request CSP nonce is supplied
+// via a directive function that reads res.locals.cspNonce at request time.
+const helmetMiddleware = helmet({
   contentSecurityPolicy: {
     directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"],
-      styleSrc: ["'self'"],
+      defaultSrc: ["'none'"],
+      scriptSrc: ["'self'", (req, res) => `'nonce-${res.locals.cspNonce}'`],
+      connectSrc: ["'self'", 'https://horizon.stellar.org', 'wss://horizon.stellar.org'],
       imgSrc: ["'self'", 'data:'],
-      connectSrc: ["'self'", 'https://horizon-testnet.stellar.org', 'https://horizon.stellar.org'],
-      fontSrc: ["'self'"],
-      objectSrc: ["'none'"],
-      frameSrc: ["'none'"],
+      frameAncestors: ["'none'"],
     },
   },
-}));
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true,
+  },
+  frameguard: { action: 'deny' },
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+});
+app.use(helmetMiddleware);
+
+// Helmet 8 has no `permissionsPolicy` option, so emit the header explicitly.
+app.use((req, res, next) => {
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  next();
+});
+
 app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true, maxAge: 86400 }));
 app.use(express.json());
 
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: { error: 'Too many requests, please try again later.' },
-});
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: { error: 'Too many auth attempts, please try again later.' },
+app.use((req, res, next) => {
+  res.removeHeader('Server');
+  next();
 });
 
-app.use('/api', limiter);
-app.use('/api/auth', authLimiter);
+// Serve uploaded avatars after the security middleware so responses carry
+// nosniff, CSP and Cross-Origin-Resource-Policy headers.
+const path = require('path');
+app.use('/uploads/avatars', express.static(path.join(__dirname, '../uploads/avatars'), {
+  setHeaders: (res) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Disposition', 'inline');
+  },
+}));
+
+// Granular per-endpoint rate limiting (Redis-backed when REDIS_URL is set)
+app.use('/api/auth/login', rateLimiters.authLimiter);
+app.use('/api/auth/register', rateLimiters.authLimiter);
 
 app.use('/api/auth', authRoutes);
-app.use('/api/wallet', walletRoutes);
-app.use('/api/payments', paymentRoutes);
-app.use('/api/payment-requests', paymentRequestRoutes);
-app.use('/api/scheduled-payments', scheduledPaymentRoutes);
-app.use('/api/anchor', anchorRoutes);
+app.use('/api/wallet', geoRestriction, walletRoutes);
+app.use('/api/payments', geoRestriction, paymentRoutes);
+app.use('/api/payment-requests', geoRestriction, paymentRequestRoutes);
+app.use('/api/scheduled-payments', geoRestriction, scheduledPaymentRoutes);
+app.use('/api/savings', geoRestriction, savingsRoutes);
+app.use('/api/anchor', geoRestriction, anchorRoutes);
 app.use('/api/analytics', analyticsRoutes);
-app.use('/api/dex', dexRoutes);
+app.use('/api/dex', geoRestriction, dexRoutes);
 app.use('/api/support', supportRoutes);
-app.use('/api/escrow', agentEscrowRoutes);
+app.use('/api/escrow', geoRestriction, agentEscrowRoutes);
 app.use('/api/referrals', referralRoutes);
 app.use('/api/loyalty', loyaltyRoutes);
 app.use('/api/disputes', disputeRoutes);
 app.use('/api/kyc', kycRoutes);
 app.use('/api/admin', ipAllowlist, adminRoutes);
 app.use('/api/prices', pricesRoutes);
-app.use('/api/channels', channelsRoutes);
+app.use('/api/channels', geoRestriction, channelsRoutes);
 app.use('/api/contracts', contractsRoutes);
+app.use('/api/ledger', ledgerRoutes);
+app.use('/api/contacts', contactsRoutes);
 app.use('/api/webhooks', webhookRoutes);
-app.use('/api/dev', toolsRoutes);
+app.use('/api/tools', toolsRoutes);
 app.use('/api/assets', assetsRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/.well-known/stellar', sep10Routes);
-app.use('/api/sep31', sep31Routes);
+app.use('/api/sep10', sep10Routes);
+app.use('/api/sep31', geoRestriction, sep31Routes);
+// BE-031: /api/dev is reserved exclusively for the env-gated developer router
+// below. A "legacy alias" that also mounted toolsRoutes at /api/dev used to
+// live here (removed) — its naming collision with this router was flagged as
+// a production-exposure risk: a future refactor reordering these two
+// app.use('/api/dev', ...) calls could accidentally make dev-only tooling
+// reachable in production. devRoutes is defense-in-depth gated twice: once
+// here (NODE_ENV !== 'production') and again inside routes/dev.js itself
+// (NODE_ENV !== 'development'), so it is a 404 in any non-development env.
 if (process.env.NODE_ENV !== 'production') {
   app.use('/api/dev', devRoutes);
 }
@@ -158,73 +213,9 @@ const swaggerOptions = {
               }
             }
           }
-        }
-      }
-    }
-  },
-  apis: ['./src/routes/*.js']
-};
+        },
+        // Derived directly from the express-validator field spec in
+        // validators/paymentSendValidators.js so the docs cannot drift from
+        // what the runtime v
 
-const specs = swaggerJsdoc(swaggerOptions);
-
-app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(specs));
-
-/**
- * @openapi
- * /health:
- *   get:
- *     summary: Public liveness probe
- *     description: Returns the overall status and pool utilization. Use /api/admin/health for full diagnostics.
- *     tags: [Health]
- *     responses:
- *       200:
- *         description: Service is healthy
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 status:
- *                   type: string
- *                   enum: [ok, degraded]
- *                 pool:
- *                   type: object
- *                   properties:
- *                     total: { type: integer }
- *                     idle: { type: integer }
- *                     waiting: { type: integer }
- *       503:
- *         description: Service is degraded
- */
-app.get('/health', async (req, res) => {
-  try {
-    const health = await runHealthChecks();
-    res.status(health.status === 'ok' ? 200 : 503).json({
-      status: health.status,
-      pool: health.pool,
-    });
-  } catch {
-    res.status(503).json({ status: 'degraded' });
-  }
-});
-
-app.get('/metrics', async (req, res) => {
-  const token = process.env.METRICS_TOKEN;
-  if (token) {
-    const auth = req.headers.authorization || '';
-    if (auth !== `Bearer ${token}`) {
-      return res.status(401).end();
-    }
-  }
-  res.set('Content-Type', registry.contentType);
-  res.end(await registry.metrics());
-});
-
-app.use(Sentry.Handlers.errorHandler());
-
-app.use((err, req, res, next) => {
-  req.logger.error(err.message, { stack: err.stack, status: err.status });
-  res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
-});
-
-module.exports = app;
+/* … truncated 72 chars — edit only what you need near the top … */

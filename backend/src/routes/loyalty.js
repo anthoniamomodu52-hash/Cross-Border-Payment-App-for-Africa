@@ -1,8 +1,11 @@
 const router = require("express").Router();
 const authMiddleware = require("../middleware/auth");
-const { balance, redeem, history } = require("../controllers/loyaltyController");
+const { readLimiter } = require("../middleware/rateLimiter");
+const isAdmin = require("../middleware/isAdmin");
+const { balance, redeem, history, mint } = require("../controllers/loyaltyController");
 
 router.use(authMiddleware);
+router.use(readLimiter);
 
 /**
  * @swagger
@@ -56,5 +59,35 @@ router.post("/redeem", redeem);
  *         description: List of loyalty events
  */
 router.get("/history", history);
+
+/**
+ * @swagger
+ * /api/loyalty/mint:
+ *   post:
+ *     summary: Mint loyalty tokens to a user (admin/internal only)
+ *     tags: [Loyalty]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [user_id, points]
+ *             properties:
+ *               user_id:
+ *                 type: string
+ *               points:
+ *                 type: integer
+ *     responses:
+ *       200:
+ *         description: Tokens minted
+ *       400:
+ *         description: Invalid input
+ *       403:
+ *         description: Admin access required
+ */
+router.post("/mint", isAdmin, mint);
 
 module.exports = router;
