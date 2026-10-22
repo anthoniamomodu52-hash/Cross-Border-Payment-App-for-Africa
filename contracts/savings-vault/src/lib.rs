@@ -685,8 +685,9 @@ impl SavingsVaultContract {
             .get(&DataKey::TokenAddress)
             .expect("Contract not initialized");
 
-        token::Client::new(&env, &token_address).transfer_from(
-            &env.current_contract_address(),
+        // `user.require_auth()` above already authorises this transfer within the
+        // same invocation, so no separate `approve` transaction is needed.
+        token::Client::new(&env, &token_address).transfer(
             &user,
             &env.current_contract_address(),
             &amount,
@@ -873,8 +874,8 @@ impl SavingsVaultContract {
             .get(&DataKey::TokenAddress)
             .expect("Contract not initialized");
 
-        token::Client::new(&env, &token_address).transfer_from(
-            &env.current_contract_address(),
+        // Authorised by `distributor.require_auth()` above; no allowance required.
+        token::Client::new(&env, &token_address).transfer(
             &distributor,
             &env.current_contract_address(),
             &amount,

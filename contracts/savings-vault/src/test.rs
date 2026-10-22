@@ -831,3 +831,43 @@ fn test_invariant_sum_vault_balances_equals_total_locked() {
     sum_balances = users.iter().map(|u| client.get_balance(u)).sum();
     assert_eq!(client.get_total_locked(), sum_balances);
 }
+
+// ── Deposits / yield pull funds with a direct transfer (no approve needed) ────
+
+#[test]
+fn test_deposit_needs_no_prior_approve() {
+    let (env, client, admin, usdc_id) = setup();
+    let user = Address::generate(&env);
+    let amount = 100_0000000i128;
+    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    let token = TokenClient::new(&env, &usdc_id);
+
+    // No approve() call: the user's auth on deposit() covers the transfer.
+    assert_eq!(token.allowance(&user, &client.address), 0);
+    client.deposit(&user, &amount, &(env.ledger().timestamp() + 86400));
+
+    assert_eq!(token.balance(&user), 0);
+    assert_eq!(token.balance(&client.address), amount);
+    assert_eq!(client.get_total_locked(), amount);
+}
+
+#[test]
+fn test_distribute_yield_needs_no_prior_approve() {
+    let (env, client, admin, usdc_id) = setup();
+    let distributor = Address::generate(&env);
+    client.set_yield_distributor(&admin, &distributor);
+
+    let user = Address::generate(&env);
+    mint_usdc(&env, &usdc_id, &admin, &user, 100_0000000);
+    client.deposit(&user, &100_0000000, &(env.ledger().timestamp() + 86400));
+
+    let amount = 5_0000000i128;
+    mint_usdc(&env, &usdc_id, &admin, &distributor, amount);
+    let token = TokenClient::new(&env, &usdc_id);
+    assert_eq!(token.allowance(&distributor, &client.address), 0);
+
+    client.distribute_yield(&distributor, &amount);
+
+    assert_eq!(token.balance(&distributor), 0);
+    assert_eq!(token.balance(&client.address), 100_0000000 + amount);
+}
