@@ -104,7 +104,8 @@ const EVALUATORS = {
 
 /**
  * Evaluate all active fraud rules against a payment.
- * Returns { blocked, rule, message } where blocked=false if no rule triggers.
+ * Returns { blocked, rule, message, reason } where blocked=false if no rule
+ * triggers. `reason` mirrors `message` for callers that read it (BE-151).
  */
 async function checkFraud(walletAddress, amount, asset, paymentId = null) {
   let rules;
@@ -163,7 +164,12 @@ async function checkFraud(walletAddress, amount, asset, paymentId = null) {
         });
         continue;
       }
-      return { blocked: true, rule: rule.name, message: result.message };
+      return {
+        blocked: true,
+        rule: rule.name,
+        message: result.message,
+        reason: result.message,
+      };
     }
   }
 
@@ -198,11 +204,11 @@ async function checkDailyLimit(walletAddress, amount, asset) {
   return sentUsd + newUsd > limitUsd;
 }
 
-async function logFraudBlock(walletAddress, reason, amount, asset) {
+async function logFraudBlock(walletAddress, reason, amount, asset, rule = null) {
   await db.query(
-    `INSERT INTO fraud_blocks (wallet_address, reason, amount, asset)
-     VALUES ($1, $2, $3, $4)`,
-    [walletAddress, reason, amount, asset]
+    `INSERT INTO fraud_blocks (wallet_address, reason, rule, amount, asset)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [walletAddress, reason, rule, amount, asset]
   );
 }
 
