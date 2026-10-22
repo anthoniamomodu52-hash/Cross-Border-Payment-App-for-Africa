@@ -30,6 +30,7 @@
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Symbol};
 
+#[cfg(test)]
 mod test;
 
 // ── Storage keys ──────────────────────────────────────────────────────────────

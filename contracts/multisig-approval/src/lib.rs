@@ -4,6 +4,7 @@ use soroban_sdk::{
     Vec,
 };
 
+#[cfg(test)]
 mod test;
 
 const DEFAULT_PROPOSAL_TTL_SECS: u64 = 604_800; // 7 days

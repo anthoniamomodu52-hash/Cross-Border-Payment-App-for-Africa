@@ -57,7 +57,9 @@ pub struct AllowanceValue {
     pub expires_at: u64,
 }
 
+#[cfg(test)]
 mod test;
+mod test_allowance;
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -264,18 +266,44 @@ impl LoyaltyTokenContract {
 
     // ── SEP-41: allowances ────────────────────────────────────────────────────
 
+    /// Remaining allowance, or 0 once the current ledger is past the
+    /// expiration ledger the owner set.
     pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
-        let key = DataKey::Allowance(from, spender);
+        Self::read_allowance(&env, &from, &spender).amount
+    }
+
+    /// Live allowance (amount + original expiration). Expired entries read as
+    /// amount 0 so callers can't spend them.
+    fn read_allowance(env: &Env, from: &Address, spender: &Address) -> AllowanceValue {
+        let key = DataKey::Allowance(from.clone(), spender.clone());
         match env.storage().persistent().get::<DataKey, AllowanceValue>(&key) {
-            Some(a) => {
-                if a.expires_at != 0 && env.ledger().sequence() as u64 > a.expires_at {
-                    0
-                } else {
-                    a.amount
-                }
-            }
-            None => 0,
+            Some(a) if (env.ledger().sequence() as u64) <= a.expires_at => a,
+            Some(a) => AllowanceValue { amount: 0, expires_at: a.expires_at },
+            None => AllowanceValue { amount: 0, expires_at: 0 },
         }
+    }
+
+    /// SEP-41: a non-zero allowance must not already be expired.
+    fn check_expiration(env: &Env, amount: i128, expiration_ledger: u32) {
+        if amount > 0 && expiration_ledger < env.ledger().sequence() {
+            panic!("expiration_ledger is less than ledger seq when amount > 0");
+        }
+    }
+
+    /// Deduct `amount` from `spender`'s allowance, keeping the expiration
+    /// ledger the owner originally granted.
+    fn spend_allowance(env: &Env, from: &Address, spender: &Address, amount: i128) {
+        let current = Self::read_allowance(env, from, spender);
+        if current.amount < amount {
+            panic!("insufficient allowance");
+        }
+        env.storage().persistent().set(
+            &DataKey::Allowance(from.clone(), spender.clone()),
+            &AllowanceValue {
+                amount: current.amount - amount,
+                expires_at: current.expires_at,
+            },
+        );
     }
 
     /// Approve `spender` to spend `amount` of `from`'s tokens until `expiration_ledger`.
@@ -293,6 +321,7 @@ impl LoyaltyTokenContract {
         if amount < 0 {
             panic!("amount must be non-negative");
         }
+        Self::check_expiration(&env, amount, expiration_ledger);
         let key = DataKey::Allowance(from.clone(), spender.clone());
         env.storage().persistent().set(
             &key,
@@ -324,6 +353,7 @@ impl LoyaltyTokenContract {
         let key = DataKey::Allowance(from.clone(), spender.clone());
         let current = Self::allowance(env.clone(), from.clone(), spender.clone());
         let new_amount = current + amount;
+        Self::check_expiration(&env, new_amount, expiration_ledger);
         env.storage().persistent().set(
             &key,
             &AllowanceValue {
@@ -354,6 +384,7 @@ impl LoyaltyTokenContract {
         let key = DataKey::Allowance(from.clone(), spender.clone());
         let current = Self::allowance(env.clone(), from.clone(), spender.clone());
         let new_amount = if amount > current { 0 } else { current - amount };
+        Self::check_expiration(&env, new_amount, expiration_ledger);
         env.storage().persistent().set(
             &key,
             &AllowanceValue {
@@ -394,18 +425,7 @@ impl LoyaltyTokenContract {
         if amount < 0 {
             panic!("amount must be non-negative");
         }
-        let key = DataKey::Allowance(from.clone(), spender.clone());
-        let current = Self::allowance(env.clone(), from.clone(), spender.clone());
-        if current < amount {
-            panic!("insufficient allowance");
-        }
-        env.storage().persistent().set(
-            &key,
-            &AllowanceValue {
-                amount: current - amount,
-                expires_at: 0,
-            },
-        );
+        Self::spend_allowance(&env, &from, &spender, amount);
         Self::move_balance(&env, &from, &to, amount);
         env.events().publish(
             (symbol_short!("transfer"), from, to),
@@ -471,18 +491,7 @@ impl LoyaltyTokenContract {
         if amount < 0 {
             panic!("amount must be non-negative");
         }
-        let key = DataKey::Allowance(from.clone(), spender.clone());
-        let current = Self::allowance(env.clone(), from.clone(), spender.clone());
-        if current < amount {
-            panic!("insufficient allowance");
-        }
-        env.storage().persistent().set(
-            &key,
-            &AllowanceValue {
-                amount: current - amount,
-                expires_at: 0,
-            },
-        );
+        Self::spend_allowance(&env, &from, &spender, amount);
         let balance = Self::balance(env.clone(), from.clone());
         if balance < amount {
             panic!("insufficient balance");
