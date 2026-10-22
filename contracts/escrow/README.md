@@ -27,6 +27,7 @@ The escrow lifecycle is:
 - `Pending` → `Released` when the assigned agent calls `release_escrow` or fully settles the escrow with `partial_release`
 - `Pending` → `Cancelled` when the original sender calls `cancel_escrow`
 - `Pending` → `UnderDispute` when the sender or recipient calls `dispute_escrow`, handing the full balance to the dispute-resolution contract for arbitration
+- `UnderDispute` → `Cancelled` (sender won) or `Released` (agent or recipient won) when the dispute contract settles the dispute and calls `close_disputed_escrow` (#1367)
 
 Completed or cancelled escrow records may be archived after a configurable retention period to limit persistent storage growth.
 
@@ -533,6 +534,26 @@ Panics / Errors:
 Events:
 - `EscrowDisputed`
 
+### `close_disputed_escrow` / `get_escrow_dispute` / `get_escrow_dispute_winner`
+
+```rust
+fn close_disputed_escrow(env: Env, escrow_id: u64, winner: Address)
+fn get_escrow_dispute(env: Env, escrow_id: u64) -> Option<EscrowDispute>
+fn get_escrow_dispute_winner(env: Env, escrow_id: u64) -> Option<Address>
+```
+
+- `dispute_escrow` stores an `EscrowDispute { dispute_contract, dispute_id }`
+  record for the escrow.
+- When the dispute is settled (finalized, appeal resolved, panel quorum, or
+  expired), the dispute contract pays the winner and calls
+  `close_disputed_escrow`. Only that dispute contract may call it
+  (`dispute_contract.require_auth()`).
+- The escrow moves to `Cancelled` if the winner is the sender, otherwise
+  `Released`, and the winner is stored. Emits `EscrowDisputeClosed
+  { escrow_id, dispute_id, winner, status }`.
+- The escrow is then eligible for `cleanup_escrow`, which also removes the
+  dispute record.
+
 ### Dispute-resolution setup
 
 The dispute-resolution contract must register this escrow as its trusted escrow
@@ -636,6 +657,8 @@ This contract stores state under the following `DataKey` variants in persistent 
 - `DataKey::DisputeContractAddress` -> `Address` (dispute-resolution contract used by `dispute_escrow`)
 - `DataKey::ContractVersion` -> `u32`
 - `DataKey::PlatformFeeBps` -> `u32` (fee applied to new escrows; see `set_fee_bps`)
+- `DataKey::EscrowDispute(u64)` -> `EscrowDispute` (dispute contract + dispute ID of a disputed escrow)
+- `DataKey::EscrowDisputeWinner(u64)` -> `Address` (party paid by the dispute, once settled)
 
 ### `Escrow` struct layout
 

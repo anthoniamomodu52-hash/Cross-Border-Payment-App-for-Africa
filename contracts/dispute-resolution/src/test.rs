@@ -720,7 +720,7 @@ fn test_open_escrow_dispute_non_escrow_caller_panics() {
     // Without the escrow contract's authorization (i.e. it is not the direct
     // invoker), the call must be rejected.
     env.set_auths(&[]);
-    client.open_escrow_dispute(&escrow, &sender, &recipient, &agent, &500_0000000, &false);
+    client.open_escrow_dispute(&escrow, &1u64, &sender, &recipient, &agent, &500_0000000, &false);
 }
 
 #[test]
@@ -733,5 +733,5 @@ fn test_open_escrow_dispute_unregistered_escrow_panics() {
     let recipient = Address::generate(&env);
     let agent = Address::generate(&env);
     client.set_escrow_contract(&admin, &escrow);
-    client.open_escrow_dispute(&impostor, &sender, &recipient, &agent, &500_0000000, &false);
+    client.open_escrow_dispute(&impostor, &1u64, &sender, &recipient, &agent, &500_0000000, &false);
 }

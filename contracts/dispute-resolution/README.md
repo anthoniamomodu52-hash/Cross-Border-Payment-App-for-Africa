@@ -23,7 +23,7 @@ Free-form disputes (not linked to an escrow or payment ID) remain allowed. The `
 
 ## Escrow disputes and the payout agent
 
-`open_escrow_dispute(escrow_contract, sender, recipient, agent, amount, payout_confirmed)`
+`open_escrow_dispute(escrow_contract, escrow_id, sender, recipient, agent, amount, payout_confirmed)`
 is called only by the registered escrow contract. Escrow funds are released to
 the **agent**, who pays the recipient in fiat off-chain, so the agent is a party
 to the dispute (#1366):
@@ -38,6 +38,11 @@ to the dispute (#1366):
   may `claim_expired`, and the funds go to the agent (`DisputeExpiredToAgent`
   event). Otherwise the sender is refunded as usual.
 - `get_dispute_agent` returns the agent (`None` for free-form disputes).
+- `escrow_id` is stored with the dispute. Every settlement path
+  (`finalize_resolution`, `resolve_appeal*`, `cast_vote` quorum,
+  `claim_expired`) pays the winner and then calls the escrow's
+  `close_disputed_escrow(escrow_id, winner)` so the escrow leaves
+  `UnderDispute` (#1367).
 
 ## API
 

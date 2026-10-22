@@ -147,6 +147,27 @@ pub struct EscrowDisputed {
     pub payout_confirmed: bool,
 }
 
+/// Emitted by `close_disputed_escrow` when the dispute contract reports the
+/// outcome of a disputed escrow.
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowDisputeClosed {
+    pub escrow_id: u64,
+    pub dispute_id: u64,
+    pub winner: Address,
+    pub status: EscrowStatus,
+}
+
+/// Link between a disputed escrow and its dispute. Kept under a separate
+/// storage key so existing `Escrow` records still decode.
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowDispute {
+    /// Dispute-resolution contract that holds the funds.
+    pub dispute_contract: Address,
+    pub dispute_id: u64,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct Escrow {
@@ -170,9 +191,11 @@ pub enum EscrowStatus {
     Released,
     Cancelled,
     /// Escrowed funds have been handed to the dispute-resolution contract and
-    /// the escrow is awaiting (or already subject to) arbitration. In this state
-    /// the escrow can no longer be released, cancelled, deposited into, or
-    /// expired — the winning party is paid directly by the dispute contract.
+    /// the escrow is awaiting arbitration. In this state the escrow can no
+    /// longer be released, cancelled, deposited into, or expired — the winning
+    /// party is paid directly by the dispute contract, which then calls
+    /// `close_disputed_escrow` to move the escrow to `Released` (agent or
+    /// recipient won) or `Cancelled` (sender won).
     UnderDispute,
 }
 
@@ -189,6 +212,10 @@ pub enum DataKey {
     ContractVersion,
     /// Platform fee (bps) applied to every new escrow. Set by the admin.
     PlatformFeeBps,
+    /// `EscrowDispute` record for an escrow sent to dispute.
+    EscrowDispute(u64),
+    /// Party the dispute paid, once the dispute is settled.
+    EscrowDisputeWinner(u64),
 }
 
 const DEFAULT_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
@@ -692,12 +719,21 @@ impl EscrowContract {
             soroban_sdk::vec![
                 &env,
                 env.current_contract_address().into_val(&env),
+                escrow_id.into_val(&env),
                 escrow.sender.clone().into_val(&env),
                 escrow.recipient.clone().into_val(&env),
                 escrow.agent.clone().into_val(&env),
                 escrow.amount.into_val(&env),
                 escrow.payout_confirmed.into_val(&env)
             ],
+        );
+
+        env.storage().persistent().set(
+            &DataKey::EscrowDispute(escrow_id),
+            &EscrowDispute {
+                dispute_contract,
+                dispute_id,
+            },
         );
 
         env.events().publish(
@@ -713,6 +749,70 @@ impl EscrowContract {
         );
 
         dispute_id
+    }
+
+    /// Record the outcome of a disputed escrow. Called by the dispute-resolution
+    /// contract that holds the escrow's funds, after it has paid `winner`.
+    ///
+    /// Moves the escrow from `UnderDispute` to `Cancelled` if the sender won
+    /// (refund) or `Released` otherwise, so it can later be archived with
+    /// `cleanup_escrow` (#1367). Emits `EscrowDisputeClosed`.
+    pub fn close_disputed_escrow(env: Env, escrow_id: u64, winner: Address) {
+        let record: EscrowDispute = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowDispute(escrow_id))
+            .expect("Escrow has no dispute");
+        // Only the dispute contract that took custody of the funds may report
+        // the outcome; it is authorised as the direct invoker.
+        record.dispute_contract.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .unwrap_or_else(|| panic!("Escrow {} not found", escrow_id));
+        if escrow.status != EscrowStatus::UnderDispute {
+            panic!("Escrow is not under dispute");
+        }
+
+        escrow.status = if winner == escrow.sender {
+            EscrowStatus::Cancelled
+        } else {
+            EscrowStatus::Released
+        };
+        escrow.updated_at = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowDisputeWinner(escrow_id), &winner);
+
+        env.events().publish(
+            (Symbol::new(&env, "EscrowDisputeClosed"),),
+            EscrowDisputeClosed {
+                escrow_id,
+                dispute_id: record.dispute_id,
+                winner,
+                status: escrow.status,
+            },
+        );
+    }
+
+    /// Dispute record for an escrow sent to dispute, or `None` if never disputed.
+    pub fn get_escrow_dispute(env: Env, escrow_id: u64) -> Option<EscrowDispute> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscrowDispute(escrow_id))
+    }
+
+    /// Party a disputed escrow's dispute paid, or `None` if not yet settled.
+    pub fn get_escrow_dispute_winner(env: Env, escrow_id: u64) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscrowDisputeWinner(escrow_id))
     }
 
     pub fn partial_release(env: Env, agent: Address, escrow_id: u64, amount: i128) {
@@ -833,6 +933,12 @@ impl EscrowContract {
         }
 
         env.storage().persistent().remove(&DataKey::Escrow(escrow_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EscrowDispute(escrow_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EscrowDisputeWinner(escrow_id));
 
         env.events().publish(
             (Symbol::new(&env, "EscrowArchived"),),

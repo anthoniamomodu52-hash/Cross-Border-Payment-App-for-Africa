@@ -40,7 +40,7 @@
 //!    marked `ResolvedForRecipient` or `ResolvedForSender`.
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token, Address, Bytes, Env, Symbol, Vec,
+    contract, contractimpl, contracttype, token, Address, Bytes, Env, IntoVal, Symbol, Vec,
 };
 
 mod test;
@@ -102,6 +102,9 @@ pub enum DataKey {
     AgentEvidence(u64),
     /// Present while the pending (or final) ruling awards the funds to the agent.
     RulingForAgent(u64),
+    /// `(escrow contract, escrow_id)` backing an escrow dispute. Used to report
+    /// the outcome back via `close_disputed_escrow`.
+    EscrowRef(u64),
 }
 
 // ── Domain types ──────────────────────────────────────────────────────────────
@@ -262,6 +265,20 @@ fn payout_confirmed(env: &Env, dispute_id: u64) -> bool {
         .persistent()
         .get(&DataKey::PayoutConfirmed(dispute_id))
         .unwrap_or(false)
+}
+
+/// Tell the escrow contract backing `dispute_id` (if any) who won, so the
+/// escrow leaves `UnderDispute` and becomes eligible for cleanup (#1367).
+fn notify_escrow(env: &Env, dispute_id: u64, winner: &Address) {
+    let escrow_ref: Option<(Address, u64)> =
+        env.storage().persistent().get(&DataKey::EscrowRef(dispute_id));
+    if let Some((escrow_contract, escrow_id)) = escrow_ref {
+        env.invoke_contract::<()>(
+            &escrow_contract,
+            &Symbol::new(env, "close_disputed_escrow"),
+            soroban_sdk::vec![env, escrow_id.into_val(env), winner.into_val(env)],
+        );
+    }
 }
 
 /// The ruling currently recorded on a dispute in `Appealing` status.
@@ -456,12 +473,14 @@ impl DisputeResolutionContract {
     ///
     /// # Arguments
     /// * `escrow_contract`  — Calling escrow contract (must be registered).
+    /// * `escrow_id`        — Escrow to notify via `close_disputed_escrow` on settlement.
     /// * `sender`, `recipient`, `agent` — Escrow parties.
     /// * `amount`           — USDC (stroops) already transferred.
     /// * `payout_confirmed` — Whether the agent had called `confirm_delivery`.
     pub fn open_escrow_dispute(
         env: Env,
         escrow_contract: Address,
+        escrow_id: u64,
         sender: Address,
         recipient: Address,
         agent: Address,
@@ -512,6 +531,9 @@ impl DisputeResolutionContract {
         env.storage()
             .persistent()
             .set(&DataKey::PayoutConfirmed(id), &payout_confirmed);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowRef(id), &(escrow_contract, escrow_id));
 
         let total_disputes: u64 = env
             .storage()
@@ -792,6 +814,7 @@ impl DisputeResolutionContract {
             &winner,
             &dispute.amount,
         );
+        notify_escrow(env, dispute_id, &winner);
 
         env.events().publish(
             (Symbol::new(env, "DisputeResolved"),),
@@ -909,6 +932,7 @@ impl DisputeResolutionContract {
             &claimant,
             &dispute.amount,
         );
+        notify_escrow(&env, dispute_id, &claimant);
 
         if pays_agent {
             env.events().publish(
@@ -1204,16 +1228,17 @@ impl DisputeResolutionContract {
                 dispute.sender.clone()
             };
 
+            env.storage()
+                .persistent()
+                .set(&DataKey::Dispute(dispute_id), &dispute);
+
             Self::settle_filing_fee(&env, dispute_id, &winner, &usdc);
             token::Client::new(&env, &usdc).transfer(
                 &env.current_contract_address(),
                 &winner,
                 &dispute.amount,
             );
-
-            env.storage()
-                .persistent()
-                .set(&DataKey::Dispute(dispute_id), &dispute);
+            notify_escrow(&env, dispute_id, &winner);
 
             env.events().publish(
                 (Symbol::new(&env, "QuorumReached"),),
