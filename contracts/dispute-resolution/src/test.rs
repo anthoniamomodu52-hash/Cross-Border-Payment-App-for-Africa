@@ -293,7 +293,7 @@ fn test_resolve_for_sender_refunds_sender() {
     env.ledger().with_mut(|li| li.timestamp += 24 * 60 * 60 + 1);
     client.finalize_resolution(&id);
 
-    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), amount);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), amount + DEFAULT_FILING_FEE); // winning opener gets the filing fee back
     assert_eq!(client.get_dispute(&id).status, DisputeStatus::ResolvedForSender);
 }
 
@@ -537,7 +537,7 @@ fn test_super_arbitrator_resolution_for_sender() {
     client.resolve_dispute(&arbitrator, &id, &true);
     client.appeal(&recipient, &id);
     client.resolve_appeal(&super_arbitrator, &id, &false);
-    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), amount);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), amount + DEFAULT_FILING_FEE); // winning opener gets the filing fee back
     assert_eq!(client.get_dispute(&id).status, DisputeStatus::ResolvedForSender);
 }
 
@@ -658,7 +658,7 @@ fn test_cast_vote_quorum_for_sender() {
     // Second vote: 2-of-3 → quorum reached, funds refunded.
     client.cast_vote(&arb2, &id, &false);
     assert_eq!(client.get_dispute(&id).status, DisputeStatus::ResolvedForSender);
-    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), amount);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), amount + DEFAULT_FILING_FEE); // winning opener gets the filing fee back
 }
 
 /// Acceptance criterion: no quorum — only 1-of-3 votes cast, split 1-for-recipient
@@ -715,7 +715,25 @@ fn test_open_escrow_dispute_non_escrow_caller_panics() {
     let escrow = Address::generate(&env);
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
     client.set_escrow_contract(&admin, &escrow);
+    // Without the escrow contract's authorization (i.e. it is not the direct
+    // invoker), the call must be rejected.
+    env.set_auths(&[]);
+    client.open_escrow_dispute(&escrow, &1u64, &sender, &recipient, &agent, &500_0000000, &false);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: escrow contract not registered")]
+fn test_open_escrow_dispute_unregistered_escrow_panics() {
+    let (env, client, admin, _, _, _) = setup();
+    let escrow = Address::generate(&env);
+    let impostor = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    client.set_escrow_contract(&admin, &escrow);
+    client.open_escrow_dispute(&impostor, &1u64, &sender, &recipient, &agent, &500_0000000, &false);
     // Drop the blanket auth mock: a caller that is not the escrow contract
     // cannot produce `escrow.require_auth()`, so this must be rejected.
     env.set_auths(&[]);

@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, String, Symbol};
 
 #[cfg(test)]
 mod test;
@@ -66,7 +66,9 @@ pub struct EscrowParams {
     pub recipient: Address,
     pub agent: Address,
     pub amount: i128,
-    pub release_fee_bps: u32,
+    /// Highest platform fee (bps) the sender accepts for this escrow. The
+    /// escrow always uses the admin-configured fee; this is only a guard.
+    pub max_fee_bps: u32,
 }
 
 #[derive(Clone)]
@@ -126,6 +128,13 @@ pub struct FeeUpdated {
     pub new_fee_bps: u32,
 }
 
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct PlatformFeeUpdated {
+    pub old_fee_bps: u32,
+    pub new_fee_bps: u32,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct EscrowDeposited {
@@ -141,7 +150,30 @@ pub struct EscrowDisputed {
     pub escrow_id: u64,
     pub dispute_id: u64,
     pub opener: Address,
+    pub agent: Address,
     pub amount: i128,
+    pub payout_confirmed: bool,
+}
+
+/// Emitted by `close_disputed_escrow` when the dispute contract reports the
+/// outcome of a disputed escrow.
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowDisputeClosed {
+    pub escrow_id: u64,
+    pub dispute_id: u64,
+    pub winner: Address,
+    pub status: EscrowStatus,
+}
+
+/// Link between a disputed escrow and its dispute. Kept under a separate
+/// storage key so existing `Escrow` records still decode.
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowDispute {
+    /// Dispute-resolution contract that holds the funds.
+    pub dispute_contract: Address,
+    pub dispute_id: u64,
 }
 
 #[derive(Clone)]
@@ -160,16 +192,18 @@ pub struct Escrow {
     pub expires_at: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[contracttype]
 pub enum EscrowStatus {
     Pending,
     Released,
     Cancelled,
     /// Escrowed funds have been handed to the dispute-resolution contract and
-    /// the escrow is awaiting (or already subject to) arbitration. In this state
-    /// the escrow can no longer be released, cancelled, deposited into, or
-    /// expired — the winning party is paid directly by the dispute contract.
+    /// the escrow is awaiting arbitration. In this state the escrow can no
+    /// longer be released, cancelled, deposited into, or expired — the winning
+    /// party is paid directly by the dispute contract, which then calls
+    /// `close_disputed_escrow` to move the escrow to `Released` (agent or
+    /// recipient won) or `Cancelled` (sender won).
     UnderDispute,
 }
 
@@ -184,6 +218,12 @@ pub enum DataKey {
     KycContractAddress,
     DisputeContractAddress,
     ContractVersion,
+    /// Platform fee (bps) applied to every new escrow. Set by the admin.
+    PlatformFeeBps,
+    /// `EscrowDispute` record for an escrow sent to dispute.
+    EscrowDispute(u64),
+    /// Party the dispute paid, once the dispute is settled.
+    EscrowDisputeWinner(u64),
     /// Minimum seconds an escrow must be held before the sender may cancel it.
     CancelHoldSecs,
 }
@@ -206,6 +246,9 @@ const MAX_CANCEL_HOLD_SECS: u64 = 7 * 24 * 60 * 60;
 /// Maximum allowed fee: 10% (1000 bps) per issue #766.
 const MAX_FEE_BPS: u32 = 1000;
 
+/// Platform fee used until the admin calls `set_fee_bps`: 2.5% (250 bps).
+const DEFAULT_PLATFORM_FEE_BPS: u32 = 250;
+
 /// Minimum escrow amount in stroops to prevent integer-division rounding to zero fee.
 const MIN_ESCROW_AMOUNT: i128 = 100;
 
@@ -213,6 +256,10 @@ const MIN_ESCROW_AMOUNT: i128 = 100;
 // MAX_ESCROW_AMOUNT = 1,000,000 USDC = 10_000_000_000_000 stroops.
 // Intermediate fee calc uses (amount / 10000).saturating_mul(bps) to prevent overflow.
 const MAX_ESCROW_AMOUNT: i128 = 10_000_000_000_000;
+
+/// Strkey of the contract address whose 32 id bytes are all zero. Setting the
+/// KYC contract to this address disables KYC checks.
+const ZERO_CONTRACT_ADDRESS: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
 
 fn require_admin(env: &Env, admin: &Address) {
     admin.require_auth();
@@ -226,6 +273,21 @@ fn require_admin(env: &Env, admin: &Address) {
     }
 }
 
+fn platform_fee_bps(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PlatformFeeBps)
+        .unwrap_or(DEFAULT_PLATFORM_FEE_BPS)
+}
+
+/// Returns the configured platform fee, panicking if it is higher than the
+/// sender's `max_fee_bps` guard.
+fn fee_for_new_escrow(env: &Env, max_fee_bps: u32) -> u32 {
+    let fee_bps = platform_fee_bps(env);
+    if fee_bps > max_fee_bps {
+        panic!("Platform fee exceeds max_fee_bps");
+    }
+    fee_bps
 fn cancel_hold_period(env: &Env) -> u64 {
     env.storage()
         .persistent()
@@ -251,6 +313,20 @@ fn is_kyc_verified(env: &Env, wallet: &Address) -> bool {
 
     match kyc_contract {
         None => true, // KYC checking disabled
+        Some(addr) => {
+            // Check if address is the all-zero contract address
+            let zero_addr = Address::from_string(&String::from_str(env, ZERO_CONTRACT_ADDRESS));
+            if addr == zero_addr {
+                true // KYC checking disabled
+            } else {
+                // Cross-contract call to kyc-attestation contract
+                env.invoke_contract::<bool>(
+                    &addr,
+                    &Symbol::new(env, "is_verified"),
+                    soroban_sdk::vec![env, wallet.clone().into_val(env)],
+                )
+            }
+        }
         Some(addr) => env.invoke_contract::<bool>(
             &addr,
             &Symbol::new(env, "is_verified"),
@@ -280,6 +356,9 @@ impl EscrowContract {
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::UsdcAddress, &usdc_address);
         env.storage().persistent().set(&DataKey::EscrowCounter, &0u64);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlatformFeeBps, &DEFAULT_PLATFORM_FEE_BPS);
         env.storage()
             .persistent()
             .set(&DataKey::ContractVersion, &CONTRACT_VERSION);
@@ -344,13 +423,18 @@ impl EscrowContract {
         );
     }
 
+    /// Lock `amount` USDC from `sender` in a new escrow.
+    ///
+    /// The release fee is the admin-configured platform fee (`get_fee_bps`),
+    /// never a caller-chosen value. `max_fee_bps` is a slippage guard: the
+    /// call fails if the configured fee is higher than the sender accepts.
     pub fn create_escrow(
         env: Env,
         sender: Address,
         recipient: Address,
         agent: Address,
         amount: i128,
-        release_fee_bps: u32,
+        max_fee_bps: u32,
     ) -> u64 {
         if amount < MIN_ESCROW_AMOUNT {
             panic!("Amount below minimum (100 stroops)");
@@ -358,12 +442,7 @@ impl EscrowContract {
         if amount > MAX_ESCROW_AMOUNT {
             panic!("Amount exceeds maximum escrow amount");
         }
-        if release_fee_bps == 10000 {
-            panic!("Fee cannot be 100%");
-        }
-        if release_fee_bps > MAX_FEE_BPS {
-            panic!("Fee exceeds maximum of 1000 bps (10%)");
-        }
+        let release_fee_bps = fee_for_new_escrow(&env, max_fee_bps);
         if sender == recipient || sender == agent || recipient == agent {
             panic!("Sender, recipient, and agent must be distinct addresses");
         }
@@ -601,9 +680,12 @@ impl EscrowContract {
 
     /// Escalate a pending escrow to the configured dispute-resolution contract.
     ///
-    /// Either the escrow sender or recipient may open a dispute — this is the
-    /// sender's recourse when the agent has confirmed delivery but has not
-    /// released funds (and `cancel_escrow` is therefore blocked).
+    /// Before the agent confirms delivery, either the sender or the recipient
+    /// may open a dispute. After `confirm_delivery` the agent has already paid
+    /// out fiat, so only the recipient (who would know the payout never
+    /// arrived) may dispute; the sender may not (#1366). The agent is
+    /// registered as a dispute party and can be awarded the funds, and a
+    /// post-confirmation dispute that expires unresolved pays the agent.
     ///
     /// The full remaining escrow balance is transferred to the dispute-resolution
     /// contract, which takes custody of it for arbitration. The escrow is then
@@ -611,7 +693,8 @@ impl EscrowContract {
     /// into, or expired. The adjudicated winner is paid by the dispute contract.
     ///
     /// # Arguments
-    /// * `caller`   — Must be the escrow sender or recipient (auth required).
+    /// * `caller`   — The escrow recipient, or the sender before delivery is
+    ///                confirmed (auth required).
     /// * `escrow_id` — The escrow to escalate.
     ///
     /// # Returns
@@ -636,6 +719,9 @@ impl EscrowContract {
         }
         if escrow.status != EscrowStatus::Pending {
             panic!("Escrow is not in pending state");
+        }
+        if escrow.payout_confirmed && caller == escrow.sender {
+            panic!("Delivery confirmed: only the recipient can dispute");
         }
 
         let usdc_address: Address = env
@@ -666,10 +752,21 @@ impl EscrowContract {
             soroban_sdk::vec![
                 &env,
                 env.current_contract_address().into_val(&env),
+                escrow_id.into_val(&env),
                 escrow.sender.clone().into_val(&env),
                 escrow.recipient.clone().into_val(&env),
-                escrow.amount.into_val(&env)
+                escrow.agent.clone().into_val(&env),
+                escrow.amount.into_val(&env),
+                escrow.payout_confirmed.into_val(&env)
             ],
+        );
+
+        env.storage().persistent().set(
+            &DataKey::EscrowDispute(escrow_id),
+            &EscrowDispute {
+                dispute_contract,
+                dispute_id,
+            },
         );
 
         env.events().publish(
@@ -678,11 +775,77 @@ impl EscrowContract {
                 escrow_id,
                 dispute_id,
                 opener: caller,
+                agent: escrow.agent.clone(),
                 amount: escrow.amount,
+                payout_confirmed: escrow.payout_confirmed,
             },
         );
 
         dispute_id
+    }
+
+    /// Record the outcome of a disputed escrow. Called by the dispute-resolution
+    /// contract that holds the escrow's funds, after it has paid `winner`.
+    ///
+    /// Moves the escrow from `UnderDispute` to `Cancelled` if the sender won
+    /// (refund) or `Released` otherwise, so it can later be archived with
+    /// `cleanup_escrow` (#1367). Emits `EscrowDisputeClosed`.
+    pub fn close_disputed_escrow(env: Env, escrow_id: u64, winner: Address) {
+        let record: EscrowDispute = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowDispute(escrow_id))
+            .expect("Escrow has no dispute");
+        // Only the dispute contract that took custody of the funds may report
+        // the outcome; it is authorised as the direct invoker.
+        record.dispute_contract.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .unwrap_or_else(|| panic!("Escrow {} not found", escrow_id));
+        if escrow.status != EscrowStatus::UnderDispute {
+            panic!("Escrow is not under dispute");
+        }
+
+        escrow.status = if winner == escrow.sender {
+            EscrowStatus::Cancelled
+        } else {
+            EscrowStatus::Released
+        };
+        escrow.updated_at = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowDisputeWinner(escrow_id), &winner);
+
+        env.events().publish(
+            (Symbol::new(&env, "EscrowDisputeClosed"),),
+            EscrowDisputeClosed {
+                escrow_id,
+                dispute_id: record.dispute_id,
+                winner,
+                status: escrow.status,
+            },
+        );
+    }
+
+    /// Dispute record for an escrow sent to dispute, or `None` if never disputed.
+    pub fn get_escrow_dispute(env: Env, escrow_id: u64) -> Option<EscrowDispute> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscrowDispute(escrow_id))
+    }
+
+    /// Party a disputed escrow's dispute paid, or `None` if not yet settled.
+    pub fn get_escrow_dispute_winner(env: Env, escrow_id: u64) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscrowDisputeWinner(escrow_id))
     }
 
     pub fn partial_release(env: Env, agent: Address, escrow_id: u64, amount: i128) {
@@ -840,6 +1003,12 @@ impl EscrowContract {
         }
 
         env.storage().persistent().remove(&DataKey::Escrow(escrow_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EscrowDispute(escrow_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EscrowDisputeWinner(escrow_id));
 
         env.events().publish(
             (Symbol::new(&env, "EscrowArchived"),),
@@ -1018,15 +1187,17 @@ impl EscrowContract {
         );
     }
 
-    /// Update the fee for an escrow. Only the contract admin can call this.
+    /// Lower the fee of a pending escrow. Only the contract admin can call this.
     ///
-    /// The escrow must be in Pending status. Emits a FeeUpdated event with the
-    /// old and new fee values.
+    /// The sender agreed to the fee recorded at creation, so the admin may only
+    /// reduce it — never raise it after funds are locked (#1365). Emits a
+    /// FeeUpdated event with the old and new fee values.
     ///
     /// # Arguments
     /// * `admin`       — Must match the admin set during `initialize`.
     /// * `escrow_id`   — ID of the escrow to update.
-    /// * `new_fee_bps` — New fee in basis points (0–5000).
+    /// * `new_fee_bps` — New fee in basis points; at most the current fee and
+    ///                   never above `MAX_FEE_BPS` (1000).
     pub fn update_fee(env: Env, admin: Address, escrow_id: u64, new_fee_bps: u32) {
         admin.require_auth();
 
@@ -1041,7 +1212,7 @@ impl EscrowContract {
         }
 
         if new_fee_bps > MAX_FEE_BPS {
-            panic!("New fee exceeds maximum of 5000 bps (50%)");
+            panic!("New fee exceeds maximum of 1000 bps (10%)");
         }
 
         let mut escrow: Escrow = env
@@ -1052,6 +1223,9 @@ impl EscrowContract {
 
         if escrow.status != EscrowStatus::Pending {
             panic!("Escrow is not in pending state");
+        }
+        if new_fee_bps > escrow.release_fee_bps {
+            panic!("Fee on an existing escrow can only be lowered");
         }
 
         let old_fee_bps = escrow.release_fee_bps;
@@ -1068,6 +1242,33 @@ impl EscrowContract {
                 new_fee_bps,
             },
         );
+    }
+
+    /// Set the platform fee applied to new escrows. Admin only.
+    ///
+    /// Bounded by `MAX_FEE_BPS` (10%). Existing escrows keep the fee they were
+    /// created with. Emits `PlatformFeeUpdated`.
+    pub fn set_fee_bps(env: Env, admin: Address, fee_bps: u32) {
+        require_admin(&env, &admin);
+        if fee_bps > MAX_FEE_BPS {
+            panic!("Fee exceeds maximum of 1000 bps (10%)");
+        }
+        let old_fee_bps = platform_fee_bps(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlatformFeeBps, &fee_bps);
+        env.events().publish(
+            (Symbol::new(&env, "PlatformFeeUpdated"),),
+            PlatformFeeUpdated {
+                old_fee_bps,
+                new_fee_bps: fee_bps,
+            },
+        );
+    }
+
+    /// The platform fee (bps) that new escrows will use.
+    pub fn get_fee_bps(env: Env) -> u32 {
+        platform_fee_bps(&env)
     }
 
     pub fn get_contract_version(env: Env) -> u32 {
@@ -1128,12 +1329,7 @@ impl EscrowContract {
             if escrow_params.amount > MAX_ESCROW_AMOUNT {
                 panic!("Amount exceeds maximum escrow amount");
             }
-            if escrow_params.release_fee_bps == 10000 {
-                panic!("Fee cannot be 100%");
-            }
-            if escrow_params.release_fee_bps > MAX_FEE_BPS {
-                panic!("Fee exceeds maximum of 1000 bps (10%)");
-            }
+            fee_for_new_escrow(&env, escrow_params.max_fee_bps);
             if sender == escrow_params.recipient
                 || sender == escrow_params.agent
                 || escrow_params.recipient == escrow_params.agent
@@ -1165,6 +1361,7 @@ impl EscrowContract {
 
         let first_id = current_id + 1;
         let now = env.ledger().timestamp();
+        let release_fee_bps = platform_fee_bps(&env);
 
         for escrow_params in escrows.iter() {
             let next_id = current_id.checked_add(1).expect("Escrow counter overflow");
@@ -1176,7 +1373,7 @@ impl EscrowContract {
                 recipient: escrow_params.recipient.clone(),
                 agent: escrow_params.agent.clone(),
                 amount: escrow_params.amount,
-                release_fee_bps: escrow_params.release_fee_bps,
+                release_fee_bps,
                 status: EscrowStatus::Pending,
                 payout_confirmed: false,
                 created_at: now,
@@ -1196,7 +1393,7 @@ impl EscrowContract {
                     recipient: escrow_params.recipient.clone(),
                     agent: escrow_params.agent.clone(),
                     amount: escrow_params.amount,
-                    release_fee_bps: escrow_params.release_fee_bps,
+                    release_fee_bps,
                 },
             );
         }
