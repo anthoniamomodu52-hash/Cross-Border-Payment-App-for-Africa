@@ -341,6 +341,23 @@ impl RecurringPaymentsContract {
         )
     }
 
+    /// Next due date after a successful execution at `now`, kept on the
+    /// original schedule grid (`next_payment_at + k * interval`).
+    ///
+    /// Normally this is just `next_payment_at + interval`. If the execution
+    /// was so late that this is already due (only possible when the grace
+    /// period is at least one interval), it skips ahead to the first grid
+    /// slot after `now`, so one call never unlocks a burst of back-to-back
+    /// payments.
+    fn next_anchored_due(schedule: &RecurringSchedule, now: u64) -> u64 {
+        let mut next = schedule.next_payment_at + schedule.interval;
+        if next <= now {
+            let behind = now - next;
+            next += (behind / schedule.interval + 1) * schedule.interval;
+        }
+        next
+    }
+
     /// Execute a due payment for `schedule_id`.
     /// Anyone may call this (permissionless / incentivized execution).
     ///
@@ -468,7 +485,12 @@ impl RecurringPaymentsContract {
             .persistent()
             .set(&DataKey::MissedExecutions(schedule_id), &0u64);
 
-        schedule.next_payment_at = now + schedule.interval;
+        // Anchor the next due date to the schedule, not to when this call
+        // happened. Using `now + interval` made every late (in-grace)
+        // execution push the schedule later, so a "1st of the month" payment
+        // drifted by days over a year and disagreed with the off-chain
+        // calendar.
+        schedule.next_payment_at = Self::next_anchored_due(&schedule, now);
         schedule.executions_completed += 1;
 
         // Cancel schedule if max executions reached

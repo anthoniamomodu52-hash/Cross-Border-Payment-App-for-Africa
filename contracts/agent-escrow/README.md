@@ -118,16 +118,22 @@ Returns total platform fees accumulated but not yet withdrawn.
 
 ---
 
-#### `withdraw_fees(env, admin, amount)`
-Withdraws accumulated platform fees to the admin address.
+#### `withdraw_fees(env, to, amount)`
+Withdraws `amount` of the accumulated platform fees to `to`. Requires the
+stored admin's authorisation. Partial withdrawals are supported; insurance
+contributions are not withdrawable here.
 
 **Arguments:**
-- `admin`: Must match the admin set during `initialize`
-- `amount`: Amount to withdraw (must not exceed accumulated fees)
+- `to`: Recipient of the fees (e.g. treasury). Must not be the contract itself
+- `amount`: Amount to withdraw (must be positive and not exceed accumulated fees)
 
 **Panics if:**
-- Caller is not admin
-- Withdrawal amount exceeds accumulated fees
+- Admin has not authorised the call
+- `amount` is zero/negative or exceeds accumulated fees
+- `to` is the contract address
+
+**Events:**
+- `FeesWithdrawn`: `{ admin, to, amount, remaining_fees }`
 
 ---
 
@@ -200,6 +206,7 @@ pub struct AgentEscrow {
 - **EscrowCreated**: Emitted when a new escrow is created
 - **PayoutConfirmed**: Emitted when agent confirms payout
 - **EscrowCancelled**: Emitted when sender cancels escrow
+- **FeesWithdrawn**: Emitted when the admin withdraws platform fees
 
 ---
 
