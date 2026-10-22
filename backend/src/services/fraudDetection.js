@@ -42,7 +42,8 @@ async function evaluateVelocity(rule, walletAddress) {
   const { max_transactions, window_minutes } = rule.parameters;
   const { rows } = await db.query(
     `SELECT COUNT(*) FROM transactions
-     WHERE sender_wallet = $1 AND created_at > NOW() - ($2 * INTERVAL '1 minute')`,
+     WHERE sender_wallet = $1 AND created_at > NOW() - ($2 * INTERVAL '1 minute')
+       AND status NOT IN ('failed', 'cancelled')`,
     [walletAddress, window_minutes]
   );
   const count = parseInt(rows[0].count, 10);
@@ -50,6 +51,7 @@ async function evaluateVelocity(rule, walletAddress) {
     return {
       triggered: true,
       message: `Exceeded ${max_transactions} transactions in ${window_minutes} minutes`,
+      retry_after: window_minutes * 60,
     };
   }
   return { triggered: false };
@@ -167,6 +169,9 @@ async function checkFraud(walletAddress, amount, asset, paymentId = null) {
       return {
         blocked: true,
         rule: rule.name,
+        rule_type: rule.rule_type,
+        message: result.message,
+        retry_after: result.retry_after,
         message: result.message,
         reason: result.message,
       };
@@ -182,10 +187,11 @@ async function checkFraud(walletAddress, amount, asset, paymentId = null) {
 
 async function checkVelocity(walletAddress) {
   const windowHours = parseInt(process.env.DAILY_LIMIT_WINDOW_HOURS || '24', 10);
-  const maxTx = parseInt(process.env.FRAUD_MAX_TX_PER_WINDOW || '5', 10);
+  const maxTx = parseInt(process.env.FRAUD_MAX_TX_PER_WINDOW || '30', 10);
   const { rows } = await db.query(
     `SELECT COUNT(*) FROM transactions
-     WHERE sender_wallet = $1 AND created_at > NOW() - ($2 * INTERVAL '1 hour')`,
+     WHERE sender_wallet = $1 AND created_at > NOW() - ($2 * INTERVAL '1 hour')
+       AND status NOT IN ('failed', 'cancelled')`,
     [walletAddress, windowHours]
   );
   return parseInt(rows[0].count, 10) >= maxTx;
@@ -252,7 +258,6 @@ module.exports = {
   checkVelocity,
   checkDailyLimit,
   logFraudBlock,
-  loadRules,
   invalidateRulesCache,
   getShadowRuleReport,
 };
