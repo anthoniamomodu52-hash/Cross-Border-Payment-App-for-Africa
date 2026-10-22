@@ -940,3 +940,162 @@ fn test_distribute_yield_needs_no_prior_approve() {
     assert_eq!(token.balance(&distributor), 0);
     assert_eq!(token.balance(&client.address), 100_0000000 + amount);
 }
+
+// ── Emergency wind-down: no new deposits, pay out everything owed ─────────────
+
+fn fund_reserve(env: &Env, client: &SavingsVaultContractClient, admin: &Address, usdc_id: &Address, amount: i128) {
+    let distributor = Address::generate(env);
+    client.set_fee_distributor(admin, &distributor);
+    mint_usdc(env, usdc_id, admin, &distributor, amount);
+    client.fund_interest_reserve(&distributor, &amount);
+}
+
+fn set_yield_accrued(env: &Env, client: &SavingsVaultContractClient, user: &Address, amount: i128) {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&crate::DataKey::YieldAccrued(user.clone()), &amount);
+    });
+}
+
+fn reserve_of(env: &Env, client: &SavingsVaultContractClient) -> i128 {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&crate::DataKey::InterestReserve)
+            .unwrap_or(0i128)
+    })
+}
+
+#[test]
+#[should_panic(expected = "deposits disabled: emergency in progress")]
+fn test_deposit_rejected_after_announce_emergency() {
+    let (env, client, admin, usdc_id) = setup();
+    let user = Address::generate(&env);
+    mint_usdc(&env, &usdc_id, &admin, &user, 1_0000000);
+    client.announce_emergency(&admin);
+    client.deposit(&user, &1_0000000, &(env.ledger().timestamp() + 86_400));
+}
+
+#[test]
+#[should_panic(expected = "deposits disabled: emergency in progress")]
+fn test_deposit_rejected_while_emergency_active() {
+    let (env, client, admin, usdc_id) = setup();
+    let user = Address::generate(&env);
+    mint_usdc(&env, &usdc_id, &admin, &user, 1_0000000);
+    client.activate_emergency(&admin);
+    client.deposit(&user, &1_0000000, &(env.ledger().timestamp() + 86_400));
+}
+
+#[test]
+fn test_deposit_allowed_again_after_emergency_cancelled() {
+    let (env, client, admin, usdc_id) = setup();
+    let user = Address::generate(&env);
+    mint_usdc(&env, &usdc_id, &admin, &user, 2_0000000);
+
+    client.announce_emergency(&admin);
+    client.cancel_emergency(&admin);
+    client.activate_emergency(&admin);
+    client.deactivate_emergency(&admin);
+
+    client.deposit(&user, &1_0000000, &(env.ledger().timestamp() + 86_400));
+    assert_eq!(client.get_balance(&user), 1_0000000);
+}
+
+#[test]
+fn test_emergency_withdraw_pays_interest_and_yield() {
+    let (env, client, admin, usdc_id) = setup();
+    client.set_interest_rate(&admin, &500u32); // 5% APR
+    fund_reserve(&env, &client, &admin, &usdc_id, 1_000_0000000);
+
+    let user = Address::generate(&env);
+    let deposit = 1_000_0000000i128;
+    mint_usdc(&env, &usdc_id, &admin, &user, deposit);
+    client.deposit(&user, &deposit, &(env.ledger().timestamp() + 31_536_000));
+
+    // Half a year passes before the emergency; accrue part of it explicitly
+    // so both stored and not-yet-stored interest are covered.
+    env.ledger().with_mut(|li| li.timestamp += 31_536_000 / 4);
+    client.accrue_interest(&user, &0);
+    env.ledger().with_mut(|li| li.timestamp += 31_536_000 / 4 - 172_800);
+
+    let yield_amount = 7_0000000i128;
+    mint_usdc(&env, &usdc_id, &admin, &client.address, yield_amount);
+    set_yield_accrued(&env, &client, &user, yield_amount);
+
+    client.announce_emergency(&admin);
+    env.ledger().with_mut(|li| li.timestamp += 172_800);
+    client.emergency_withdraw(&admin, &user);
+
+    let interest = 25_0000000i128; // 5% of 1,000 over half a year
+    let token = TokenClient::new(&env, &usdc_id);
+    assert_eq!(token.balance(&user), deposit + interest + yield_amount);
+    assert_eq!(client.get_yield_accrued(&user), 0);
+    assert_eq!(reserve_of(&env, &client), 1_000_0000000 - interest);
+    assert_eq!(client.get_total_locked(), 0);
+    assert_eq!(client.get_balance(&user), 0);
+    assert_eq!(client.get_vault_ids(&user).len(), 0);
+    // Contract holds exactly the remaining reserve: nothing stranded.
+    assert_eq!(token.balance(&client.address), reserve_of(&env, &client));
+}
+
+#[test]
+fn test_emergency_withdraw_closes_all_user_vaults() {
+    let (env, client, admin, usdc_id) = setup();
+    let user = Address::generate(&env);
+    mint_usdc(&env, &usdc_id, &admin, &user, 3_0000000);
+    client.deposit(&user, &1_0000000, &(env.ledger().timestamp() + 86_400));
+    client.deposit(&user, &2_0000000, &(env.ledger().timestamp() + 172_800));
+
+    client.announce_emergency(&admin);
+    env.ledger().with_mut(|li| li.timestamp += 172_800);
+    client.emergency_withdraw(&admin, &user);
+
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&user), 3_0000000);
+    assert_eq!(client.get_vault_ids(&user).len(), 0);
+    assert_eq!(client.get_total_locked(), 0);
+}
+
+#[test]
+fn test_emergency_withdraw_caps_interest_at_reserve() {
+    let (env, client, admin, usdc_id) = setup();
+    client.set_interest_rate(&admin, &1000u32); // 10% APR
+    let reserve = 3_0000000i128;
+    fund_reserve(&env, &client, &admin, &usdc_id, reserve);
+
+    let user = Address::generate(&env);
+    let deposit = 1_000_0000000i128;
+    mint_usdc(&env, &usdc_id, &admin, &user, deposit);
+    client.deposit(&user, &deposit, &(env.ledger().timestamp() + 31_536_000));
+
+    client.announce_emergency(&admin);
+    env.ledger().with_mut(|li| li.timestamp += 31_536_000 / 2); // ~50 interest owed
+    client.emergency_withdraw(&admin, &user);
+
+    let token = TokenClient::new(&env, &usdc_id);
+    assert_eq!(token.balance(&user), deposit + reserve);
+    assert_eq!(reserve_of(&env, &client), 0);
+    assert_eq!(token.balance(&client.address), 0);
+}
+
+#[test]
+fn test_emergency_return_funds_pays_accrued_interest() {
+    let (env, client, admin, usdc_id) = setup();
+    client.set_interest_rate(&admin, &500u32);
+    fund_reserve(&env, &client, &admin, &usdc_id, 1_000_0000000);
+
+    let user = Address::generate(&env);
+    let deposit = 1_000_0000000i128;
+    mint_usdc(&env, &usdc_id, &admin, &user, deposit);
+    client.deposit(&user, &deposit, &(env.ledger().timestamp() + 31_536_000));
+
+    env.ledger().with_mut(|li| li.timestamp += 31_536_000 / 2 - 172_800);
+    client.activate_emergency(&admin);
+    env.ledger().with_mut(|li| li.timestamp += 172_800);
+    client.emergency_return_funds(&admin, &user);
+
+    let interest = 25_0000000i128;
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&user), deposit + interest);
+    assert_eq!(reserve_of(&env, &client), 1_000_0000000 - interest);
+    assert_eq!(client.get_total_locked(), 0);
+}

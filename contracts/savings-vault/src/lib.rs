@@ -91,7 +91,13 @@ pub struct EmergencyCancelledEvent {
 pub struct EmergencyWithdrawnEvent {
     pub admin: Address,
     pub user: Address,
+    /// Total paid out: principal + interest + yield.
     pub amount: i128,
+    pub principal: i128,
+    /// Accrued interest actually paid from the interest reserve.
+    pub interest: i128,
+    /// Unclaimed distributed yield paid out.
+    pub yield_amount: i128,
     pub timestamp: u64,
 }
 
@@ -313,24 +319,83 @@ impl SavingsVaultContract {
         }
     }
 
-    /// Emergency wind-down: close every vault `user` holds, send them the
-    /// combined principal and return the amount paid.
-    fn close_all_vaults(env: &Env, user: &Address, empty_msg: &str) -> i128 {
+    /// Panic if an emergency wind-down is pending or active: new funds must
+    /// not enter a vault that is about to be force-closed.
+    fn assert_accepting_deposits(env: &Env) {
+        let announced: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyWithdrawalAnnounced)
+            .unwrap_or(0);
+        let active: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyActivated)
+            .unwrap_or(false);
+        if announced != 0 || active {
+            panic!("deposits disabled: emergency in progress");
+        }
+    }
+
+    /// Emergency wind-down: close every vault `user` holds and pay out
+    /// principal, interest accrued up to now (from the interest reserve) and
+    /// any unclaimed distributed yield. Returns (principal, interest, yield).
+    fn close_all_vaults(env: &Env, user: &Address, empty_msg: &str) -> (i128, i128, i128) {
         let ids = Self::user_vault_ids(env, user);
         if ids.is_empty() {
             panic!("No vault found for user");
         }
+
         let mut principal: i128 = 0;
+        let mut interest_due: i128 = 0;
         for id in ids.iter() {
-            let vault = Self::load_vault(env, user, id);
+            let mut vault = Self::load_vault(env, user, id);
+            // Bring interest up to date so nothing earned before the
+            // wind-down is lost.
+            Self::accrue_interest_internal(env, &mut vault, false);
             principal = principal
                 .checked_add(vault.balance)
                 .expect("vault balance overflow");
+            interest_due = interest_due
+                .checked_add(vault.accrued_interest)
+                .expect("accrued interest overflow");
         }
-        if principal <= 0 {
+
+        let yield_key = DataKey::YieldAccrued(user.clone());
+        let yield_amount: i128 = env.storage().persistent().get(&yield_key).unwrap_or(0);
+
+        if principal <= 0 && interest_due <= 0 && yield_amount <= 0 {
             panic!("{}", empty_msg);
         }
 
+        // Interest is paid from the reserve, capped at what it holds.
+        let reserve = Self::get_interest_reserve(env);
+        let interest_paid = if interest_due > reserve { reserve } else { interest_due };
+        if interest_paid > 0 {
+            let rem_reserve = reserve
+                .checked_sub(interest_paid)
+                .expect("reserve underflow");
+            env.storage()
+                .persistent()
+                .set(&DataKey::InterestReserve, &rem_reserve);
+        }
+        if interest_paid < interest_due {
+            env.events().publish(
+                (Symbol::new(env, "InsufficientReserve"),),
+                InsufficientReserveEvent {
+                    user: user.clone(),
+                    requested: interest_due,
+                    paid: interest_paid,
+                    reserve_remaining: reserve - interest_paid,
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+        }
+
+        let total = principal
+            .checked_add(interest_paid)
+            .and_then(|v| v.checked_add(yield_amount))
+            .expect("payout overflow");
         let token_address: Address = env
             .storage()
             .persistent()
@@ -339,13 +404,16 @@ impl SavingsVaultContract {
         token::Client::new(env, &token_address).transfer(
             &env.current_contract_address(),
             user,
-            &principal,
+            &total,
         );
 
         for id in ids.iter() {
             env.storage().persistent().remove(&DataKey::Vault(user.clone(), id));
         }
         env.storage().persistent().remove(&DataKey::UserVaults(user.clone()));
+        if yield_amount != 0 {
+            env.storage().persistent().set(&yield_key, &0i128);
+        }
 
         let total_locked: i128 = env
             .storage()
@@ -358,7 +426,7 @@ impl SavingsVaultContract {
         env.storage()
             .persistent()
             .set(&DataKey::TotalLocked, &new_total);
-        principal
+        (principal, interest_paid, yield_amount)
     }
 
     fn get_interest_reserve(env: &Env) -> i128 {
@@ -475,6 +543,7 @@ impl SavingsVaultContract {
 
     /// Announce an emergency withdrawal. Must be called by admin.
     /// This creates a 48-hour delay before emergency withdrawals may execute.
+    /// New deposits are rejected from this point until cancelled.
     pub fn announce_emergency(env: Env, admin: Address) {
         admin.require_auth();
         let stored_admin: Address = env
@@ -506,6 +575,7 @@ impl SavingsVaultContract {
     }
 
     /// Execute an emergency withdrawal for a user after the 48-hour delay.
+    /// Pays principal + accrued interest (from the reserve) + unclaimed yield.
     /// Transitions: EmergencyAnnounced (t >= 48h) -> Closed Vault (removes vault).
     pub fn emergency_withdraw(env: Env, admin: Address, user: Address) {
         admin.require_auth();
@@ -532,14 +602,18 @@ impl SavingsVaultContract {
             panic!("emergency withdrawal not yet allowed");
         }
 
-        let amount = Self::close_all_vaults(&env, &user, "No balance to withdraw");
+        let (principal, interest, yield_amount) =
+            Self::close_all_vaults(&env, &user, "No balance to withdraw");
 
         env.events().publish(
             (Symbol::new(&env, "EmergencyWithdrawn"),),
             EmergencyWithdrawnEvent {
                 admin,
                 user,
-                amount,
+                amount: principal + interest + yield_amount,
+                principal,
+                interest,
+                yield_amount,
                 timestamp: now,
             },
         );
@@ -583,7 +657,8 @@ impl SavingsVaultContract {
 
     /// Activate emergency mode. Admin-only. Sets EmergencyActivated = true and records timestamp.
     /// Transitions: Normal -> EmergencyActive.
-    /// Emits EmergencyActivated event. Normal deposit/withdraw remain unblocked.
+    /// Emits EmergencyActivated event. New deposits are rejected until
+    /// deactivated; normal withdrawals remain unblocked.
     pub fn activate_emergency(env: Env, admin: Address) {
         admin.require_auth();
         let stored_admin: Address = env
@@ -632,7 +707,8 @@ impl SavingsVaultContract {
 
     /// Return full vault balance to user. Admin-only, callable only after 48h from activation.
     /// Transitions: EmergencyActive (t >= 48h) -> Closed Vault (removes vault).
-    /// Normal deposit/withdraw are NOT blocked. Emits EmergencyFundsReturned event.
+    /// Pays principal + accrued interest + unclaimed yield. Normal withdrawals
+    /// are NOT blocked. Emits EmergencyFundsReturned event.
     pub fn emergency_return_funds(env: Env, admin: Address, user: Address) {
         admin.require_auth();
         let stored_admin: Address = env
@@ -655,10 +731,19 @@ impl SavingsVaultContract {
         if now < activated_at.saturating_add(172_800) {
             panic!("emergency return not yet allowed: 48h not elapsed");
         }
-        let amount = Self::close_all_vaults(&env, &user, "No balance to return");
+        let (principal, interest, yield_amount) =
+            Self::close_all_vaults(&env, &user, "No balance to return");
         env.events().publish(
             (Symbol::new(&env, "EmergencyFundsReturned"),),
-            EmergencyWithdrawnEvent { admin, user, amount, timestamp: now },
+            EmergencyWithdrawnEvent {
+                admin,
+                user,
+                amount: principal + interest + yield_amount,
+                principal,
+                interest,
+                yield_amount,
+                timestamp: now,
+            },
         );
     }
 
@@ -701,6 +786,7 @@ impl SavingsVaultContract {
     /// penalty exposure) of funds the user already has in other vaults.
     pub fn deposit(env: Env, user: Address, amount: i128, unlock_time: u64) -> u32 {
         user.require_auth();
+        Self::assert_accepting_deposits(&env);
         if amount <= 0 {
             panic!("Amount must be positive");
         }

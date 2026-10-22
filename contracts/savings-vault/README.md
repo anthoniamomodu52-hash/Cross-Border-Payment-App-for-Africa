@@ -55,6 +55,18 @@ The savings vault features an admin-controlled emergency mode surface governed b
    - Can be deactivated via `deactivate_emergency(admin)` -> returns to `Normal`.
    - After 48 hours, `emergency_return_funds(admin, user)` can be executed -> transfers the user's full balance across all their vaults, closes those vaults, and updates `TotalLocked`.
 
+### Deposits and Payouts During an Emergency
+
+- While an emergency is announced (`EmergencyWithdrawalAnnounced > 0`) or active
+  (`EmergencyActivated == true`), `deposit` panics with
+  `"deposits disabled: emergency in progress"`. Cancelling / deactivating re-enables deposits.
+  Normal `withdraw` is never blocked.
+- `emergency_withdraw` and `emergency_return_funds` first accrue interest up to the current
+  time, then pay the user, for all of their vaults: principal + accrued interest (taken from
+  `InterestReserve`, capped at what the reserve holds, with an `InsufficientReserve` event for
+  any shortfall) + unclaimed `YieldAccrued(user)`. `TotalLocked` drops by the principal and
+  `InterestReserve` by the interest paid, so accounting stays consistent (SC-037).
+
 ### Mutual Exclusivity & Safety
 
 - `emergency_withdraw` and `emergency_return_funds` are mutually exclusive per vault. When either function executes, all of the user's vault records are deleted from storage. Any subsequent call to `emergency_withdraw`, `emergency_return_funds`, or `withdraw` for that vault will panic with `No vault found for user` or `No balance to return`.
