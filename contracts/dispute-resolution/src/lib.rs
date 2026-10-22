@@ -77,6 +77,9 @@ pub enum DataKey {
     FeeDistributorAddress,
     /// The address that paid the filing fee for a given dispute.
     FilingFeeHolder(u64),
+    /// The filing fee amount actually paid for a given dispute. Stored so a
+    /// later `update_filing_fee` cannot change what is refunded or forfeited.
+    FilingFeePaid(u64),
     /// Individual vote cast by one panel arbitrator on a dispute.
     /// Value is `bool`: `true` = for recipient, `false` = for sender.
     Vote(u64, Address),
@@ -323,9 +326,7 @@ impl DisputeResolutionContract {
             resolved_for_recipient: false,
         };
         env.storage().persistent().set(&DataKey::Dispute(id), &dispute);
-        env.storage()
-            .persistent()
-            .set(&DataKey::FilingFeeHolder(id), &opener);
+        Self::record_filing_fee(&env, id, &opener, filing_fee);
 
         // Update TotalDisputes counter
         let total_disputes: u64 = env.storage().persistent().get(&DataKey::TotalDisputes).unwrap_or(0);
@@ -359,25 +360,21 @@ impl DisputeResolutionContract {
 
     /// Open a dispute backed by funds held in an escrow contract.
     ///
-    /// Cross-contract hook called by the escrow contract (see
-    /// `contracts/escrow`). The escrow has already transferred `amount` USDC
-    /// into this contract's custody; this function records the dispute so the
-    /// normal resolution/appeal/expiry flow applies. The adjudicated winner is
-    /// paid directly from the locked funds.
-    ///
-    /// Unlike [`open_dispute`], no filing fee is charged: the escrow contract
-    /// transfers only the disputed `amount`, and only the registered escrow
-    /// contract may call this function.
+    /// Called only by the registered escrow contract, which has already
+    /// moved `amount` USDC here. Like [`open_dispute`], the `opener` pays the
+    /// filing fee from their own balance: refunded if they win, forfeited to
+    /// the fee distributor if they lose.
     ///
     /// # Arguments
-    /// * `escrow_contract` — The calling escrow contract. Must be the immediate
-    ///                       caller and match the registered escrow contract.
+    /// * `escrow_contract` — The calling (registered) escrow contract.
+    /// * `opener`          — Sender or recipient escalating; pays the fee.
     /// * `sender`          — Original escrow sender.
     /// * `recipient`       — Intended escrow recipient.
     /// * `amount`          — USDC amount (in stroops) already transferred.
     pub fn open_escrow_dispute(
         env: Env,
         escrow_contract: Address,
+        opener: Address,
         sender: Address,
         recipient: Address,
         amount: i128,
@@ -385,9 +382,10 @@ impl DisputeResolutionContract {
         if amount <= 0 {
             panic!("amount must be positive");
         }
-        if env.caller() != escrow_contract {
-            panic!("unauthorized: caller is not the escrow contract");
-        }
+        // A contract calling another contract is implicitly authorized for
+        // its own address, so this only passes when `escrow_contract` is the
+        // direct caller.
+        escrow_contract.require_auth();
         let trusted_escrow: Address = env
             .storage()
             .persistent()
@@ -395,6 +393,29 @@ impl DisputeResolutionContract {
             .expect("escrow contract not set");
         if escrow_contract != trusted_escrow {
             panic!("unauthorized: escrow contract not registered");
+        }
+        if opener != sender && opener != recipient {
+            panic!("opener must be sender or recipient");
+        }
+
+        opener.require_auth();
+
+        let usdc: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UsdcAddress)
+            .expect("not initialized");
+        let filing_fee: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FilingFee)
+            .unwrap_or(50_000000);
+        if filing_fee > 0 {
+            let token_client = token::Client::new(&env, &usdc);
+            if token_client.balance(&opener) < filing_fee {
+                panic!("Insufficient balance for dispute filing fee");
+            }
+            token_client.transfer(&opener, &env.current_contract_address(), &filing_fee);
         }
 
         let id: u64 = env
@@ -422,6 +443,7 @@ impl DisputeResolutionContract {
             resolved_for_recipient: false,
         };
         env.storage().persistent().set(&DataKey::Dispute(id), &dispute);
+        Self::record_filing_fee(&env, id, &opener, filing_fee);
 
         let total_disputes: u64 = env
             .storage()
@@ -774,6 +796,16 @@ impl DisputeResolutionContract {
             &dispute.amount,
         );
 
+        // The arbitrator missed the deadline, so the opener is not at fault:
+        // refund the filing fee to whoever paid it.
+        let fee_holder: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FilingFeeHolder(dispute_id));
+        if let Some(holder) = fee_holder {
+            Self::settle_filing_fee(&env, dispute_id, &holder, &usdc);
+        }
+
         dispute.status = DisputeStatus::Expired;
         env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
 
@@ -812,12 +844,28 @@ impl DisputeResolutionContract {
             .set(&DataKey::FeeDistributorAddress, &fee_distributor);
     }
 
+    fn record_filing_fee(env: &Env, dispute_id: u64, opener: &Address, fee: i128) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::FilingFeeHolder(dispute_id), opener);
+        env.storage()
+            .persistent()
+            .set(&DataKey::FilingFeePaid(dispute_id), &fee);
+    }
+
     fn settle_filing_fee(env: &Env, dispute_id: u64, winner: &Address, usdc: &Address) {
+        // Prefer the amount recorded at open time; fall back to the current
+        // fee for disputes opened before `FilingFeePaid` existed.
         let fee_amount: i128 = env
             .storage()
             .persistent()
-            .get(&DataKey::FilingFee)
-            .unwrap_or(50_000000);
+            .get(&DataKey::FilingFeePaid(dispute_id))
+            .unwrap_or_else(|| {
+                env.storage()
+                    .persistent()
+                    .get(&DataKey::FilingFee)
+                    .unwrap_or(50_000000)
+            });
         if fee_amount <= 0 {
             return;
         }

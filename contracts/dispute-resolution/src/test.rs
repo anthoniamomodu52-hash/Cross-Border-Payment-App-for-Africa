@@ -163,6 +163,24 @@ fn test_open_dispute_insufficient_filing_fee_panics() {
 }
 
 #[test]
+fn test_fee_change_after_open_settles_original_fee() {
+    let (env, client, admin, arbitrator, usdc_id, _) = setup();
+    let amount = 1_000_0000000i128;
+    let (sender, _, id) = open(&env, &client, &usdc_id, amount);
+
+    // Raising the fee later must not change what this dispute refunds.
+    client.update_filing_fee(&admin, &100_000000);
+    client.resolve_dispute(&arbitrator, &id, &false);
+    env.ledger().with_mut(|li| li.timestamp += 24 * 60 * 60 + 1);
+    client.finalize_resolution(&id);
+
+    assert_eq!(
+        TokenClient::new(&env, &usdc_id).balance(&sender),
+        amount + DEFAULT_FILING_FEE
+    );
+}
+
+#[test]
 fn test_update_filing_fee_applies_new_fee() {
     let (env, client, admin, _, usdc_id, _) = setup();
     let amount = 1_000_0000000i128;
@@ -332,7 +350,12 @@ fn test_claim_expired_after_deadline_refunds_sender() {
     let (sender, _, id) = open(&env, &client, &usdc_id, amount);
     env.ledger().with_mut(|li| li.timestamp += 7 * 24 * 60 * 60 + 1);
     client.claim_expired(&sender, &id);
-    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), amount);
+    // Dispute amount and the filing fee both come back: the arbitrator missed
+    // the deadline, so the opener is not penalised.
+    assert_eq!(
+        TokenClient::new(&env, &usdc_id).balance(&sender),
+        amount + DEFAULT_FILING_FEE
+    );
     assert_eq!(client.get_dispute(&id).status, DisputeStatus::Expired);
 }
 
@@ -710,13 +733,70 @@ fn test_set_escrow_contract_non_admin_panics() {
 }
 
 #[test]
-#[should_panic(expected = "unauthorized: caller is not the escrow contract")]
+#[should_panic]
 fn test_open_escrow_dispute_non_escrow_caller_panics() {
     let (env, client, admin, _, _, _) = setup();
     let escrow = Address::generate(&env);
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     client.set_escrow_contract(&admin, &escrow);
-    // A top-level caller is not the escrow contract, so this must be rejected.
-    client.open_escrow_dispute(&escrow, &sender, &recipient, &500_0000000);
+    // Drop the blanket auth mock: a top-level caller cannot produce the
+    // escrow contract's authorization, so this must be rejected.
+    env.set_auths(&[]);
+    client.open_escrow_dispute(&escrow, &sender, &sender, &recipient, &500_0000000);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: escrow contract not registered")]
+fn test_open_escrow_dispute_unregistered_escrow_panics() {
+    let (env, client, admin, _, _, _) = setup();
+    let registered = Address::generate(&env);
+    let other = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    client.set_escrow_contract(&admin, &registered);
+    client.open_escrow_dispute(&other, &sender, &sender, &recipient, &500_0000000);
+}
+
+#[test]
+fn test_open_escrow_dispute_charges_filing_fee() {
+    let (env, client, admin, _, usdc_id, _) = setup();
+    let escrow = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    client.set_escrow_contract(&admin, &escrow);
+    mint(&env, &usdc_id, &recipient, DEFAULT_FILING_FEE);
+
+    let id = client.open_escrow_dispute(&escrow, &recipient, &sender, &recipient, &500_0000000);
+
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&recipient), 0);
+    assert_eq!(
+        TokenClient::new(&env, &usdc_id).balance(&client.address),
+        DEFAULT_FILING_FEE
+    );
+    assert_eq!(client.get_dispute(&id).status, DisputeStatus::Open);
+}
+
+#[test]
+#[should_panic(expected = "Insufficient balance for dispute filing fee")]
+fn test_open_escrow_dispute_without_fee_balance_panics() {
+    let (env, client, admin, _, _, _) = setup();
+    let escrow = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    client.set_escrow_contract(&admin, &escrow);
+    client.open_escrow_dispute(&escrow, &sender, &sender, &recipient, &500_0000000);
+}
+
+#[test]
+#[should_panic(expected = "opener must be sender or recipient")]
+fn test_open_escrow_dispute_third_party_opener_panics() {
+    let (env, client, admin, _, usdc_id, _) = setup();
+    let escrow = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let outsider = Address::generate(&env);
+    client.set_escrow_contract(&admin, &escrow);
+    mint(&env, &usdc_id, &outsider, DEFAULT_FILING_FEE);
+    client.open_escrow_dispute(&escrow, &outsider, &sender, &recipient, &500_0000000);
 }

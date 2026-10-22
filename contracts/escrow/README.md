@@ -498,6 +498,12 @@ dispute and takes custody of the funds; the escrow is marked `UnderDispute`
 and can no longer be released, cancelled, deposited into, or expired. The
 adjudicated winner is paid directly by the dispute-resolution contract.
 
+The caller also pays the dispute-resolution contract's **filing fee**
+(default 50 USDC) from their own balance — not from the escrowed funds. The
+fee is refunded if they win, forfeited to the fee distributor if they lose,
+and refunded if the dispute expires unresolved. This deters frivolous
+disputes.
+
 Returns the dispute ID assigned by the dispute-resolution contract.
 
 Panics / Errors:
@@ -505,6 +511,7 @@ Panics / Errors:
 - `Escrow {id} not found` if the escrow does not exist.
 - `Only the sender or recipient can dispute escrow` if the caller is neither.
 - `Escrow is not in pending state` if the escrow is no longer pending.
+- `Insufficient balance for dispute filing fee` if the caller cannot pay the fee.
 
 Events:
 - `EscrowDisputed`
