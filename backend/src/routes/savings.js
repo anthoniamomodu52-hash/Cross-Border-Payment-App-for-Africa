@@ -13,6 +13,17 @@ const validate = (req, res, next) => {
 
 router.use(auth);
 
+// BE-176: vaults are bookkeeping only (no on-chain deposit/withdraw yet), so the
+// feature is preview-only and disabled in production unless explicitly enabled.
+router.use((req, res, next) => {
+  const flag = process.env.SAVINGS_ENABLED;
+  const enabled = flag !== undefined ? flag === 'true' : process.env.NODE_ENV !== 'production';
+  if (!enabled) {
+    return res.status(503).json({ error: 'Savings vaults are not available yet', code: 'FEATURE_DISABLED' });
+  }
+  next();
+});
+
 /**
  * @swagger
  * /api/savings:

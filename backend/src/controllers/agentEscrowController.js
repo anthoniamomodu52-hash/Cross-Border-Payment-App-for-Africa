@@ -14,8 +14,9 @@
 const { v4: uuidv4 } = require("uuid");
 const db = require("../db");
 const { createEscrow, confirmPayout, cancelEscrow } = require("../services/agentEscrow");
-const { enqueueEmail } = require("../services/email");
+const { enqueueEmail, sendEscrowCancelledEmail } = require("../services/email");
 const audit = require("../services/audit");
+const logger = require("../utils/logger");
 
 const DEFAULT_FEE_BPS = parseInt(process.env.ESCROW_FEE_BPS || "250", 10);
 
@@ -303,8 +304,9 @@ async function confirm(req, res, next) {
 }
 
 /**
- * POST /api/escrow/:id/cancel
- * Sender cancels after the 48-hour window.
+ * POST /api/escrow/:id/cancel  (also served by POST /api/payments/:id/cancel)
+ * Sender cancels after the 48-hour window. DB is updated only after the
+ * on-chain cancel_escrow succeeds.
  */
 async function cancel(req, res, next) {
   try {
@@ -320,28 +322,87 @@ async function cancel(req, res, next) {
     const escrow = escrowResult.rows[0];
 
     if (escrow.status !== "pending") {
-      return res.status(400).json({ error: "Escrow is not pending" });
+      return res.status(400).json({ error: "Only pending escrows can be cancelled" });
     }
-    if (escrow.sender_wallet !== req.user.walletAddress) {
+
+    // The sender wallet may be any of the caller's wallets, not just the default.
+    const walletResult = await db.query(
+      "SELECT encrypted_secret_key FROM wallets WHERE user_id = $1 AND public_key = $2",
+      [req.user.userId, escrow.sender_wallet]
+    );
+    if (!walletResult.rows[0]) {
       return res.status(403).json({ error: "Only the sender can cancel this escrow" });
     }
 
-    const walletResult = await db.query(
-      "SELECT encrypted_secret_key FROM wallets WHERE user_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1",
-      [req.user.userId]
-    );
+    const expiresAt = escrow.expires_at
+      ? new Date(escrow.expires_at)
+      : new Date(new Date(escrow.created_at).getTime() + 48 * 60 * 60 * 1000);
+    if (new Date() < expiresAt) {
+      return res.status(403).json({
+        error: "CANCEL_TOO_EARLY",
+        message: "You cannot cancel this payment until 48 hours after creation.",
+        cancel_available_at: expiresAt.toISOString(),
+      });
+    }
 
-    const { txHash } = await cancelEscrow({
-      encryptedSecretKey: walletResult.rows[0].encrypted_secret_key,
-      escrowId: escrow.contract_escrow_id,
-    });
+    let txHash;
+    try {
+      ({ txHash } = await cancelEscrow({
+        encryptedSecretKey: walletResult.rows[0].encrypted_secret_key,
+        escrowId: escrow.contract_escrow_id,
+      }));
+    } catch (stellarErr) {
+      logger.error("On-chain cancel_escrow failed", {
+        escrowId: escrow.contract_escrow_id,
+        error: stellarErr.message,
+      });
+      return res.status(502).json({
+        error: "On-chain cancellation failed. Please try again later.",
+      });
+    }
 
     await db.query(
-      "UPDATE agent_escrows SET status = 'cancelled', confirm_tx_hash = $1 WHERE id = $2",
+      "UPDATE agent_escrows SET status = 'cancelled', cancelled_at = NOW(), confirm_tx_hash = $1 WHERE id = $2",
       [txHash, id]
     );
 
-    res.json({ message: "Escrow cancelled, funds refunded", tx_hash: txHash });
+    db.query(
+      "SELECT u.email, u.full_name FROM users u JOIN wallets w ON w.user_id = u.id WHERE w.public_key = $1 LIMIT 1",
+      [escrow.sender_wallet]
+    )
+      .then(({ rows }) => {
+        if (!rows[0]) return;
+        return sendEscrowCancelledEmail(rows[0].email, rows[0].full_name, escrow.amount, escrow.asset, txHash);
+      })
+      .catch(() => {});
+
+    await audit.auditLog(req, "escrow_cancelled", {
+      type: "agent_escrow",
+      id,
+      newValue: {
+        escrow_id: id,
+        contract_escrow_id: escrow.contract_escrow_id,
+        stellar_tx_hash: txHash,
+        cancelled_at: new Date().toISOString(),
+      },
+    });
+
+    webhook.deliver("escrow.cancelled", req.user.userId, {
+      escrow_id: id,
+      contract_escrow_id: escrow.contract_escrow_id,
+      tx_hash: txHash,
+      amount: escrow.amount,
+      asset: escrow.asset,
+      sender: escrow.sender_wallet,
+    }).catch(() => {});
+
+    res.json({
+      message: "Escrow cancelled and funds refunded to your wallet",
+      escrow_id: id,
+      contract_escrow_id: escrow.contract_escrow_id,
+      tx_hash: txHash,
+      status: "cancelled",
+    });
   } catch (err) {
     next(err);
   }
