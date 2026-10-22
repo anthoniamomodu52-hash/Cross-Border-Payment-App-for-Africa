@@ -133,6 +133,18 @@ pub struct EvtAgentRemoved {
     pub agent: Address,
 }
 
+/// Emitted by `withdraw_fees`. Topics: ("FeesWithdrawn",).
+/// Lets the off-chain indexer and auditors track platform fee withdrawals.
+#[derive(Clone)]
+#[contracttype]
+pub struct EvtFeesWithdrawn {
+    pub admin: Address,
+    pub to: Address,
+    pub amount: i128,
+    /// Withdrawable fee balance left after this withdrawal.
+    pub remaining_fees: i128,
+}
+
 /// Emitted by `reassign_escrow`. Topics: ("EscrowReassigned",).
 #[derive(Clone)]
 #[contracttype]
@@ -547,19 +559,39 @@ impl AgentEscrowContract {
         );
     }
 
-    /// Admin withdraws accumulated platform fees. Insurance contributions are
-    /// held separately in `InsuranceFund` and are not withdrawable here.
-    pub fn withdraw_fees(env: Env, to: Address) {
+    /// Admin withdraws `amount` of the accumulated platform fees to `to`.
+    /// Partial withdrawals are allowed. Insurance contributions are held
+    /// separately in `InsuranceFund` and are not withdrawable here.
+    /// Emits FeesWithdrawn event.
+    ///
+    /// # Panics
+    /// * `amount` is not positive or exceeds the withdrawable fee balance.
+    /// * `to` is this contract (the transfer would be a no-op that still
+    ///   zeroes the books).
+    pub fn withdraw_fees(env: Env, to: Address, amount: i128) {
         let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
         admin.require_auth();
-        let fees: i128 = env.storage().persistent().get(&DataKey::Fees).unwrap_or(0i128);
-        if fees <= 0 {
-            panic!("no fees to withdraw");
+        if amount <= 0 {
+            panic!("amount must be positive");
         }
-        env.storage().persistent().set(&DataKey::Fees, &0i128);
+        if to == env.current_contract_address() {
+            panic!("invalid recipient: cannot withdraw to the contract itself");
+        }
+        let fees: i128 = env.storage().persistent().get(&DataKey::Fees).unwrap_or(0i128);
+        if amount > fees {
+            panic!("insufficient accumulated fees");
+        }
+
+        let remaining_fees = fees - amount;
+        env.storage().persistent().set(&DataKey::Fees, &remaining_fees);
         let usdc: Address = env.storage().persistent().get(&DataKey::UsdcAddress).unwrap();
         let token_client = token::Client::new(&env, &usdc);
-        token_client.transfer(&env.current_contract_address(), &to, &fees);
+        token_client.transfer(&env.current_contract_address(), &to, &amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "FeesWithdrawn"),),
+            EvtFeesWithdrawn { admin, to, amount, remaining_fees },
+        );
     }
 
     /// Returns the accumulated insurance fund balance.
