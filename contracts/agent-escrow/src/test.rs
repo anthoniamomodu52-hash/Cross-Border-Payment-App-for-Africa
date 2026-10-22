@@ -980,3 +980,91 @@ fn test_partial_confirm_payout_released_amount_tracks_cumulative_gross() {
     client.partial_confirm_payout(&agent, &id, &200_0000000);
     assert_eq!(client.get_escrow(&id).released_amount, 400_0000000);
 }
+
+// ── Removed agents cannot claim; admin reassignment ──────────────────────────
+
+#[test]
+fn test_removed_agent_cannot_confirm_payout() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 250);
+    client.remove_agent(&agent);
+
+    assert!(client.try_confirm_payout(&id).is_err());
+    assert!(client.get_escrow(&id).status == EscrowStatus::Pending);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&agent), 0);
+}
+
+#[test]
+fn test_removed_agent_cannot_partial_confirm_payout() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 250);
+    client.remove_agent(&agent);
+
+    assert!(client.try_partial_confirm_payout(&id, &(amount / 2)).is_err());
+    assert_eq!(client.get_escrow(&id).released_amount, 0);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&agent), 0);
+}
+
+#[test]
+#[should_panic(expected = "agent not registered")]
+fn test_admin_release_to_removed_agent_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, 1_000_0000000, 250);
+    client.remove_agent(&agent);
+    client.admin_release(&id, &true, &Symbol::new(&env, "fraud"));
+}
+
+#[test]
+fn test_admin_can_refund_sender_of_removed_agent_escrow() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let (sender, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 250);
+    client.remove_agent(&agent);
+    client.admin_release(&id, &false, &Symbol::new(&env, "fraud"));
+
+    assert!(client.get_escrow(&id).status == EscrowStatus::Cancelled);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), amount);
+}
+
+#[test]
+fn test_reassign_escrow_to_new_agent() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let fee_bps = 250u32;
+    let (_, _, old_agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
+    client.remove_agent(&old_agent);
+
+    let new_agent = Address::generate(&env);
+    client.register_agent(&new_agent);
+    client.reassign_escrow(&id, &new_agent);
+    assert_eq!(client.get_escrow(&id).agent, new_agent);
+
+    client.confirm_payout(&id);
+    let fee = amount * fee_bps as i128 / 10_000;
+    let token = TokenClient::new(&env, &usdc_id);
+    assert_eq!(token.balance(&new_agent), amount - fee);
+    assert_eq!(token.balance(&old_agent), 0);
+    assert!(client.get_escrow(&id).status == EscrowStatus::Completed);
+}
+
+#[test]
+#[should_panic(expected = "agent not registered")]
+fn test_reassign_escrow_to_unregistered_agent_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let (_, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, 1_000_0000000, 250);
+    let stranger = Address::generate(&env);
+    client.reassign_escrow(&id, &stranger);
+}
+
+#[test]
+#[should_panic(expected = "escrow not pending")]
+fn test_reassign_completed_escrow_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let (_, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, 1_000_0000000, 250);
+    client.confirm_payout(&id);
+    let new_agent = Address::generate(&env);
+    client.register_agent(&new_agent);
+    client.reassign_escrow(&id, &new_agent);
+}

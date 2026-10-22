@@ -133,6 +133,15 @@ pub struct EvtAgentRemoved {
     pub agent: Address,
 }
 
+/// Emitted by `reassign_escrow`. Topics: ("EscrowReassigned",).
+#[derive(Clone)]
+#[contracttype]
+pub struct EvtEscrowReassigned {
+    pub escrow_id: u64,
+    pub old_agent: Address,
+    pub new_agent: Address,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct InsurancePayout {
@@ -206,6 +215,12 @@ impl AgentEscrowContract {
 
     /// Remove an agent address from the whitelist. Admin only.
     /// Emits AgentRemoved event.
+    ///
+    /// A removed agent can no longer confirm or partially confirm any escrow
+    /// assigned to them — their pending escrows are frozen. The admin can then
+    /// move each one to another agent with [`Self::reassign_escrow`] or settle
+    /// it with [`Self::admin_release`]; the sender can still cancel once the
+    /// cancel window has elapsed.
     pub fn remove_agent(env: Env, agent: Address) {
         let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
         admin.require_auth();
@@ -221,6 +236,41 @@ impl AgentEscrowContract {
             (Symbol::new(&env, "AgentRemoved"),),
             EvtAgentRemoved { agent },
         );
+    }
+
+    /// Admin reassigns a pending escrow to another registered agent, e.g.
+    /// after the original agent was removed for fraud or a compromised key.
+    /// Any amount already released stays with the old agent; only the
+    /// remaining balance can be claimed by the new agent.
+    /// Emits EscrowReassigned event.
+    pub fn reassign_escrow(env: Env, escrow_id: u64, new_agent: Address) {
+        let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let mut escrow: AgentEscrow = env.storage().persistent()
+            .get(&DataKey::Escrow(escrow_id)).expect("escrow not found");
+        if escrow.status != EscrowStatus::Pending {
+            panic!("escrow not pending");
+        }
+        if new_agent == escrow.agent {
+            panic!("new agent is the current agent");
+        }
+        Self::require_registered_agent(&env, &new_agent);
+
+        let old_agent = escrow.agent.clone();
+        escrow.agent = new_agent.clone();
+        env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
+
+        env.events().publish(
+            (Symbol::new(&env, "EscrowReassigned"),),
+            EvtEscrowReassigned { escrow_id, old_agent, new_agent },
+        );
+    }
+
+    fn require_registered_agent(env: &Env, agent: &Address) {
+        if !Self::is_registered_agent(env.clone(), agent.clone()) {
+            panic!("agent not registered");
+        }
     }
 
     /// Returns true if the address is a registered agent.
@@ -345,6 +395,9 @@ impl AgentEscrowContract {
             panic!("escrow not pending");
         }
         escrow.agent.require_auth();
+        // A removed (e.g. fraudulent or compromised) agent must not be able
+        // to claim escrows that were assigned to them before removal.
+        Self::require_registered_agent(&env, &escrow.agent);
 
         let remaining = escrow.amount - escrow.released_amount;
         let fee_amount = remaining * (escrow.fee_bps as i128) / 10_000;
@@ -376,6 +429,9 @@ impl AgentEscrowContract {
             panic!("escrow not pending");
         }
         escrow.agent.require_auth();
+        // A removed (e.g. fraudulent or compromised) agent must not be able
+        // to claim escrows that were assigned to them before removal.
+        Self::require_registered_agent(&env, &escrow.agent);
         if release_amount <= 0 {
             panic!("release_amount must be positive");
         }
@@ -441,7 +497,8 @@ impl AgentEscrowContract {
 
     /// Admin override. When `to_agent` is true the remaining balance is released
     /// to the agent (fee booked via [`Self::book_fee`]); otherwise it is refunded
-    /// to the sender with no fee.
+    /// to the sender with no fee. Releasing to a removed agent is rejected —
+    /// reassign the escrow first.
     pub fn admin_release(env: Env, escrow_id: u64, to_agent: bool, reason: Symbol) {
         let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
         admin.require_auth();
@@ -457,6 +514,7 @@ impl AgentEscrowContract {
         let token_client = token::Client::new(&env, &usdc);
 
         if to_agent {
+            Self::require_registered_agent(&env, &escrow.agent);
             let fee_amount = remaining * (escrow.fee_bps as i128) / 10_000;
             let agent_amount = remaining - fee_amount;
 
