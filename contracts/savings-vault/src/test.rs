@@ -683,6 +683,8 @@ fn test_penalty_math_property_over_input_space() {
             assert!(penalty <= amt);
         }
     }
+}
+
 // SC-034: Lock bounds tests
 #[test]
 #[should_panic(expected = "min_secs must be less than max_secs")]

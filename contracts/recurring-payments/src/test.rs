@@ -772,6 +772,8 @@ fn test_compromised_executor_rapid_calls_cannot_drain_funds() {
     client.execute_payment(&executor, &id);
     assert_eq!(token_balance(&env, &token_id, &recipient), payment_amount * 2);
     assert_eq!(token_balance(&env, &token_id, &sender), initial_balance - payment_amount * 2);
+}
+
 // ── SC-029: Pre-authorization semantics, replay/expiry tests ─────────────────
 
 #[test]
