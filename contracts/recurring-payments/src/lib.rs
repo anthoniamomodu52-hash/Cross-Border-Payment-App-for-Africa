@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol};
 
+#[cfg(test)]
 mod test;
 
 // ── Constants ─────────────────────────────────────────────────────────────────

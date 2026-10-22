@@ -56,6 +56,7 @@ pub struct AllowanceValue {
     pub expires_at: u64,
 }
 
+#[cfg(test)]
 mod test;
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
