@@ -8,7 +8,7 @@ use soroban_sdk::{
 
 use crate::{
     CONTRACT_VERSION, EscrowContract, EscrowContractClient, EscrowExpired, EscrowParams,
-    EscrowStatus, FeesWithdrawn, PartialRelease, PlatformFeeUpdated,
+    EscrowStatus, FeeUpdated, FeesWithdrawn, PartialRelease, PlatformFeeUpdated,
 };
 
 fn setup() -> (Env, EscrowContractClient<'static>, Address, Address) {
@@ -1350,4 +1350,58 @@ fn test_partial_release_becomes_full_release_when_amount_zero() {
     let escrow = client.get_escrow(&escrow_id);
     assert_eq!(escrow.amount, 0);
     assert_eq!(escrow.status, EscrowStatus::Released);
+}
+
+// ── #1365: update_fee cannot raise the fee of a funded escrow ─────────────────
+
+fn create_default_escrow(
+    env: &Env,
+    client: &EscrowContractClient,
+    admin: &Address,
+    usdc_id: &Address,
+) -> u64 {
+    let sender = Address::generate(env);
+    let recipient = Address::generate(env);
+    let agent = Address::generate(env);
+    mint_usdc(env, usdc_id, admin, &sender, 1_000_0000000);
+    client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &250)
+}
+
+#[test]
+#[should_panic(expected = "New fee exceeds maximum of 1000 bps (10%)")]
+fn test_update_fee_above_max_rejected() {
+    let (env, client, admin, usdc_id) = setup();
+    let escrow_id = create_default_escrow(&env, &client, &admin, &usdc_id);
+    client.update_fee(&admin, &escrow_id, &5000);
+}
+
+#[test]
+#[should_panic(expected = "Fee on an existing escrow can only be lowered")]
+fn test_update_fee_increase_rejected() {
+    let (env, client, admin, usdc_id) = setup();
+    let escrow_id = create_default_escrow(&env, &client, &admin, &usdc_id);
+    client.update_fee(&admin, &escrow_id, &251);
+}
+
+#[test]
+fn test_update_fee_decrease_applies_and_emits_event() {
+    let (env, client, admin, usdc_id) = setup();
+    let escrow_id = create_default_escrow(&env, &client, &admin, &usdc_id);
+    client.update_fee(&admin, &escrow_id, &100);
+    assert_eq!(client.get_escrow(&escrow_id).release_fee_bps, 100);
+
+    let (_, _, data) = find_event(&env, "FeeUpdated").expect("event not emitted");
+    let payload = FeeUpdated::from_val(&env, &data);
+    assert_eq!(payload.escrow_id, escrow_id);
+    assert_eq!(payload.old_fee_bps, 250);
+    assert_eq!(payload.new_fee_bps, 100);
+}
+
+#[test]
+#[should_panic(expected = "Only admin can update escrow fees")]
+fn test_update_fee_non_admin_rejected() {
+    let (env, client, admin, usdc_id) = setup();
+    let escrow_id = create_default_escrow(&env, &client, &admin, &usdc_id);
+    let impostor = Address::generate(&env);
+    client.update_fee(&impostor, &escrow_id, &0);
 }

@@ -988,15 +988,17 @@ impl EscrowContract {
         );
     }
 
-    /// Update the fee for an escrow. Only the contract admin can call this.
+    /// Lower the fee of a pending escrow. Only the contract admin can call this.
     ///
-    /// The escrow must be in Pending status. Emits a FeeUpdated event with the
-    /// old and new fee values.
+    /// The sender agreed to the fee recorded at creation, so the admin may only
+    /// reduce it — never raise it after funds are locked (#1365). Emits a
+    /// FeeUpdated event with the old and new fee values.
     ///
     /// # Arguments
     /// * `admin`       — Must match the admin set during `initialize`.
     /// * `escrow_id`   — ID of the escrow to update.
-    /// * `new_fee_bps` — New fee in basis points (0–5000).
+    /// * `new_fee_bps` — New fee in basis points; at most the current fee and
+    ///                   never above `MAX_FEE_BPS` (1000).
     pub fn update_fee(env: Env, admin: Address, escrow_id: u64, new_fee_bps: u32) {
         admin.require_auth();
 
@@ -1011,7 +1013,7 @@ impl EscrowContract {
         }
 
         if new_fee_bps > MAX_FEE_BPS {
-            panic!("New fee exceeds maximum of 5000 bps (50%)");
+            panic!("New fee exceeds maximum of 1000 bps (10%)");
         }
 
         let mut escrow: Escrow = env
@@ -1022,6 +1024,9 @@ impl EscrowContract {
 
         if escrow.status != EscrowStatus::Pending {
             panic!("Escrow is not in pending state");
+        }
+        if new_fee_bps > escrow.release_fee_bps {
+            panic!("Fee on an existing escrow can only be lowered");
         }
 
         let old_fee_bps = escrow.release_fee_bps;

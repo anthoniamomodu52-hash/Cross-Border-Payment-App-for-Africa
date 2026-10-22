@@ -817,7 +817,7 @@ soroban contract deploy \
 - `EscrowArchived` on `cleanup_escrow`.
 - `FeesWithdrawn` on `withdraw_fees`.
 - `EscrowDisputed` on `dispute_escrow`.
-- `FeeUpdated` on `update_fee`.
+- `FeeUpdated` on `update_fee` (admin may only lower an existing escrow's fee).
 - `Upgraded` on `upgrade`.
 - `Migrated` on `migrate`.
 
