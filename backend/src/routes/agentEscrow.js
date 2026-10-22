@@ -4,6 +4,7 @@ const StellarSdk = require("@stellar/stellar-sdk");
 const authMiddleware = require("../middleware/auth");
 const { requireStepUp } = require("../middleware/requireStepUp");
 const idempotency = require("../middleware/idempotency");
+const { readLimiter } = require("../middleware/rateLimiter");
 const { create, confirm, cancel, getEscrow, listEscrows } = require("../controllers/agentEscrowController");
 
 const validate = (req, res, next) => {

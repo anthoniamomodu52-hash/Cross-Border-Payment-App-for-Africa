@@ -52,7 +52,7 @@ function amountToStroops(amount) {
  * returns escrows the caller funded; `role=agent` returns escrows assigned to
  * the caller's agent wallet. Results are paginated.
  */
-async function list(req, res, next) {
+async function listEscrows(req, res, next) {
   try {
     const role = req.query.role === "agent" ? "agent" : "sender";
     const status = req.query.status;
@@ -486,4 +486,46 @@ async function partialRelease(req, res, next) {
   }
 }
 
-/* … truncated 4758 chars — edit only what you need near the top … */
+/**
+ * GET /api/escrow/:id
+ *
+ * Fetches a single escrow by DB id. The caller must be a party to the
+ * escrow (sender, recipient, or assigned agent); otherwise 404 is returned
+ * to avoid leaking other users' escrow details (IDOR protection).
+ */
+async function getEscrow(req, res, next) {
+  try {
+    const { id } = req.params;
+
+    const escrowResult = await db.query(
+      "SELECT * FROM agent_escrows WHERE id = $1",
+      [id]
+    );
+    if (!escrowResult.rows[0]) {
+      return res.status(404).json({ error: "Escrow not found" });
+    }
+    const escrow = escrowResult.rows[0];
+
+    // Resolve the caller's wallets to verify ownership.
+    const walletResult = await db.query(
+      "SELECT public_key FROM wallets WHERE user_id = $1",
+      [req.user.userId]
+    );
+    const callerWallets = walletResult.rows.map((row) => row.public_key);
+
+    const isParty =
+      callerWallets.includes(escrow.sender_wallet) ||
+      callerWallets.includes(escrow.agent_wallet) ||
+      callerWallets.includes(escrow.recipient_wallet);
+
+    if (!isParty) {
+      return res.status(404).json({ error: "Escrow not found" });
+    }
+
+    res.json({ escrow });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { create, confirm, cancel, partialRelease, getEscrow, listEscrows };
