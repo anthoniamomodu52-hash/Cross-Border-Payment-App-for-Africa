@@ -33,7 +33,7 @@ pub enum DataKey {
 /// Frequency of a recurring payment, expressed in seconds.
 pub type IntervalSecs = u64;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[contracttype]
 pub enum ScheduleStatus {
     Active,

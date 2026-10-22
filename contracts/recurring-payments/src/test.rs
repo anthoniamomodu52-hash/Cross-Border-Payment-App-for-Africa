@@ -1,10 +1,12 @@
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger, LedgerInfo},
+    testutils::{Address as _, Events, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
+    Address, Env, TryFromVal,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -772,6 +774,8 @@ fn test_compromised_executor_rapid_calls_cannot_drain_funds() {
     client.execute_payment(&executor, &id);
     assert_eq!(token_balance(&env, &token_id, &recipient), payment_amount * 2);
     assert_eq!(token_balance(&env, &token_id, &sender), initial_balance - payment_amount * 2);
+}
+
 // ── SC-029: Pre-authorization semantics, replay/expiry tests ─────────────────
 
 #[test]
