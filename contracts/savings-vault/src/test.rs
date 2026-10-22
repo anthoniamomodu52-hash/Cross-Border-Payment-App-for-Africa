@@ -6,7 +6,7 @@ use soroban_sdk::{
     Address, Env, FromVal, Symbol, TryFromVal, Val,
 };
 
-use crate::{AccrueInterestEvent, SavingsVaultContract, SavingsVaultContractClient};
+use crate::{AccrueInterestEvent, DepositEvent, SavingsVaultContract, SavingsVaultContractClient};
 
 fn setup() -> (Env, SavingsVaultContractClient<'static>, Address, Address) {
     let env = Env::default();
@@ -60,7 +60,7 @@ fn test_deposit() {
     client.deposit(&user, &amount, &unlock_time);
 
     assert_eq!(client.get_balance(&user), amount);
-    assert_eq!(client.get_unlock_time(&user), unlock_time);
+    assert_eq!(client.get_unlock_time(&user, &0), unlock_time);
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn test_withdraw_after_unlock() {
 
     env.ledger().set_timestamp(unlock_time + 1);
 
-    client.withdraw(&user, &amount);
+    client.withdraw(&user, &0, &amount);
 
     assert_eq!(client.get_balance(&user), 0);
     assert_eq!(TokenClient::new(&env, &usdc_id).balance(&user), amount);
@@ -111,7 +111,7 @@ fn test_early_withdrawal_with_penalty() {
     mint_usdc(&env, &usdc_id, &admin, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
 
-    client.withdraw(&user, &amount);
+    client.withdraw(&user, &0, &amount);
 
     let expected_penalty = (amount * 1000) / 10000;
     let expected_withdrawal = amount - expected_penalty;
@@ -142,7 +142,7 @@ fn test_configurable_penalty_bps() {
 
     StellarAssetClient::new(&env, &usdc_id).mint(&user, &amount);
     client.deposit(&user, &amount, &unlock_time);
-    client.withdraw(&user, &amount);
+    client.withdraw(&user, &0, &amount);
 
     let expected_penalty = (amount * 500) / 10000;
     let expected_withdrawal = amount - expected_penalty;
@@ -170,7 +170,7 @@ fn test_zero_penalty_bps_no_penalty_on_early_withdrawal() {
 
     StellarAssetClient::new(&env, &usdc_id).mint(&user, &amount);
     client.deposit(&user, &amount, &unlock_time);
-    client.withdraw(&user, &amount);
+    client.withdraw(&user, &0, &amount);
 
     assert_eq!(TokenClient::new(&env, &usdc_id).balance(&user), amount);
 }
@@ -187,7 +187,7 @@ fn test_withdraw_more_than_balance() {
     mint_usdc(&env, &usdc_id, &admin, &user, deposit_amount);
     client.deposit(&user, &deposit_amount, &unlock_time);
 
-    client.withdraw(&user, &withdraw_amount);
+    client.withdraw(&user, &0, &withdraw_amount);
 }
 
 #[test]
@@ -195,13 +195,13 @@ fn test_withdraw_more_than_balance() {
 fn test_withdraw_no_vault() {
     let (env, client, _, _) = setup();
     let user = Address::generate(&env);
-    client.withdraw(&user, &1_000_0000000);
+    client.withdraw(&user, &0, &1_000_0000000);
 }
 
 // ── #549: multi-deposit ───────────────────────────────────────────────────────
 
 #[test]
-fn test_multiple_deposits() {
+fn test_multiple_deposits_create_independent_vaults() {
     let (env, client, admin, usdc_id) = setup();
     let user = Address::generate(&env);
     let amount1 = 500_0000000i128;
@@ -211,15 +211,45 @@ fn test_multiple_deposits() {
 
     mint_usdc(&env, &usdc_id, &admin, &user, amount1 + amount2);
 
-    client.deposit(&user, &amount1, &unlock_time1);
-    client.deposit(&user, &amount2, &unlock_time2);
+    let id1 = client.deposit(&user, &amount1, &unlock_time1);
+    let id2 = client.deposit(&user, &amount2, &unlock_time2);
 
+    assert_ne!(id1, id2);
+    assert_eq!(client.get_vault_ids(&user), soroban_sdk::vec![&env, id1, id2]);
     assert_eq!(client.get_balance(&user), amount1 + amount2);
-    assert_eq!(client.get_unlock_time(&user), unlock_time2);
+    assert_eq!(client.get_vault(&user, &id1).balance, amount1);
+    assert_eq!(client.get_vault(&user, &id2).balance, amount2);
+    // Each vault keeps the unlock time it was opened with.
+    assert_eq!(client.get_unlock_time(&user, &id1), unlock_time1);
+    assert_eq!(client.get_unlock_time(&user, &id2), unlock_time2);
+    assert_eq!(client.get_total_locked(), amount1 + amount2);
 }
 
 #[test]
-fn test_second_deposit_with_earlier_unlock_preserves_later_time() {
+fn test_later_deposit_does_not_relock_unlocked_funds() {
+    // 1,000 saved with a short lock, which then expires. A new 10 deposit
+    // with a long lock must not re-lock (or penalise) the original 1,000.
+    let (env, client, admin, usdc_id) = setup();
+    let user = Address::generate(&env);
+    let first = 1_000_0000000i128;
+    let second = 10_0000000i128;
+    mint_usdc(&env, &usdc_id, &admin, &user, first + second);
+
+    let id1 = client.deposit(&user, &first, &(env.ledger().timestamp() + 86_400));
+    env.ledger().with_mut(|li| li.timestamp += 86_401); // first vault unlocked
+    let id2 = client.deposit(&user, &second, &(env.ledger().timestamp() + 300 * 86_400));
+
+    client.withdraw(&user, &id1, &first);
+
+    let token = TokenClient::new(&env, &usdc_id);
+    assert_eq!(token.balance(&user), first); // no penalty
+    assert_eq!(client.get_balance(&user), second);
+    assert_eq!(client.get_vault_ids(&user), soroban_sdk::vec![&env, id2]);
+    assert_eq!(client.get_vault(&user, &id1).balance, 0); // closed
+}
+
+#[test]
+fn test_deposit_with_earlier_unlock_keeps_requested_time() {
     let (env, client, admin, usdc_id) = setup();
     let user = Address::generate(&env);
     let amount1 = 500_0000000i128;
@@ -229,11 +259,50 @@ fn test_second_deposit_with_earlier_unlock_preserves_later_time() {
 
     mint_usdc(&env, &usdc_id, &admin, &user, amount1 + amount2);
 
-    client.deposit(&user, &amount1, &unlock_time1);
-    client.deposit(&user, &amount2, &unlock_time2);
+    let id1 = client.deposit(&user, &amount1, &unlock_time1);
+    let id2 = client.deposit(&user, &amount2, &unlock_time2);
 
-    assert_eq!(client.get_balance(&user), amount1 + amount2);
-    assert_eq!(client.get_unlock_time(&user), unlock_time1); // original later time preserved
+    // The second vault is not silently pushed out to the first one's date.
+    assert_eq!(client.get_unlock_time(&user, &id1), unlock_time1);
+    assert_eq!(client.get_unlock_time(&user, &id2), unlock_time2);
+
+    // Once the earlier vault unlocks it can be withdrawn without penalty
+    // while the other stays locked.
+    env.ledger().with_mut(|li| li.timestamp = unlock_time2);
+    client.withdraw(&user, &id2, &amount2);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&user), amount2);
+    assert_eq!(client.get_balance(&user), amount1);
+}
+
+#[test]
+fn test_deposit_event_reports_requested_unlock_time() {
+    let (env, client, admin, usdc_id) = setup();
+    let user = Address::generate(&env);
+    mint_usdc(&env, &usdc_id, &admin, &user, 2_0000000);
+    let later = env.ledger().timestamp() + 172_800;
+    let earlier = env.ledger().timestamp() + 86_400;
+    client.deposit(&user, &1_0000000, &later);
+    let id = client.deposit(&user, &1_0000000, &earlier);
+
+    let (_, _, data) = env
+        .events()
+        .all()
+        .iter()
+        .find(|(_, topics, _)| topic_is(&env, &topics, "Deposit"))
+        .expect("Deposit event not emitted");
+    let ev = DepositEvent::from_val(&env, &data);
+    assert_eq!(ev.vault_id, id);
+    assert_eq!(ev.unlock_time, earlier);
+}
+
+#[test]
+#[should_panic(expected = "No vault found for user")]
+fn test_withdraw_unknown_vault_id_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let user = Address::generate(&env);
+    mint_usdc(&env, &usdc_id, &admin, &user, 1_0000000);
+    let id = client.deposit(&user, &1_0000000, &(env.ledger().timestamp() + 86_400));
+    client.withdraw(&user, &(id + 1), &1_0000000);
 }
 
 #[test]
@@ -246,7 +315,7 @@ fn test_get_vault_returns_full_info() {
     mint_usdc(&env, &usdc_id, &admin, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
 
-    let vault = client.get_vault(&user);
+    let vault = client.get_vault(&user, &0);
     assert_eq!(vault.balance, amount);
     assert_eq!(vault.unlock_time, unlock_time);
 }
@@ -255,7 +324,7 @@ fn test_get_vault_returns_full_info() {
 fn test_get_vault_no_deposit_returns_zeros() {
     let (env, client, _, _) = setup();
     let user = Address::generate(&env);
-    let vault = client.get_vault(&user);
+    let vault = client.get_vault(&user, &0);
     assert_eq!(vault.balance, 0);
     assert_eq!(vault.unlock_time, 0);
     assert_eq!(vault.last_accrue_time, 0);
@@ -272,7 +341,7 @@ fn test_get_balance_no_vault() {
 fn test_get_unlock_time_no_vault() {
     let (env, client, _, _) = setup();
     let user = Address::generate(&env);
-    assert_eq!(client.get_unlock_time(&user), 0);
+    assert_eq!(client.get_unlock_time(&user, &0), 0);
 }
 
 #[test]
@@ -411,7 +480,7 @@ fn test_normal_withdraw_during_emergency_succeeds() {
     client.deposit(&user, &amount, &unlock_time);
     client.activate_emergency(&admin);
     // user can still self-withdraw during emergency window
-    client.withdraw(&user, &amount);
+    client.withdraw(&user, &0, &amount);
     assert_eq!(client.get_balance(&user), 0);
 }
 
@@ -446,12 +515,12 @@ fn test_accrue_interest_credits_vault_balance() {
     // Advance 1 year
     env.ledger().with_mut(|li| li.timestamp += 31_536_000);
 
-    client.accrue_interest(&user);
+    client.accrue_interest(&user, &0);
 
     // 5% of 1000 USDC = 50 USDC
     let expected_interest = 50_0000000i128;
     assert_eq!(client.get_balance(&user), deposit);
-    assert_eq!(client.get_vault(&user).accrued_interest, expected_interest);
+    assert_eq!(client.get_vault(&user, &0).accrued_interest, expected_interest);
 }
 
 #[test]
@@ -466,7 +535,7 @@ fn test_accrue_interest_emits_event() {
     client.set_interest_rate(&admin, &500u32);
 
     env.ledger().with_mut(|li| li.timestamp += 31_536_000);
-    client.accrue_interest(&user);
+    client.accrue_interest(&user, &0);
 
     let event_name = "AccrueInterest";
     let events = env.events().all();
@@ -495,7 +564,7 @@ fn test_accrue_interest_without_rate_panics() {
     client.deposit(&user, &deposit, &unlock_time);
 
     env.ledger().with_mut(|li| li.timestamp += 86400);
-    client.accrue_interest(&user);
+    client.accrue_interest(&user, &0);
 }
 
 #[test]
@@ -511,8 +580,8 @@ fn test_accrue_interest_is_user_callable() {
 
     // accrue_interest is authorised by the vault owner; no admin needed.
     env.ledger().with_mut(|li| li.timestamp += 86400);
-    client.accrue_interest(&user);
-    assert!(client.get_vault(&user).accrued_interest > 0);
+    client.accrue_interest(&user, &0);
+    assert!(client.get_vault(&user, &0).accrued_interest > 0);
 }
 
 #[test]
@@ -532,9 +601,9 @@ fn test_two_depositors_independent() {
     client.deposit(&user2, &amount2, &unlock_time2);
 
     assert_eq!(client.get_balance(&user1), amount1);
-    assert_eq!(client.get_unlock_time(&user1), unlock_time1);
+    assert_eq!(client.get_unlock_time(&user1, &0), unlock_time1);
     assert_eq!(client.get_balance(&user2), amount2);
-    assert_eq!(client.get_unlock_time(&user2), unlock_time2);
+    assert_eq!(client.get_unlock_time(&user2, &0), unlock_time2);
 }
 
 // ── SC-033: Emergency Mode State Machine & Illegal Transition Tests ───────────
@@ -764,9 +833,9 @@ fn test_flash_deposit_yield_capture_is_time_weighted() {
     env.ledger().with_mut(|li| li.timestamp += 1);
 
     // Accrue interest after 1 second
-    client.accrue_interest(&user);
+    client.accrue_interest(&user, &0);
 
-    let vault = client.get_vault(&user);
+    let vault = client.get_vault(&user, &0);
     // Yield for 1 second out of 31,536,000 seconds per year at 10%
     // Full year interest would be 100 USDC (100_0000000). For 1 second, it should be tiny (< 1 USDC)
     assert!(vault.accrued_interest < 1_0000000i128);
@@ -803,19 +872,19 @@ fn test_invariant_sum_vault_balances_equals_total_locked() {
     // Checkpoint 2: Accrue interest over time across vaults
     env.ledger().with_mut(|li| li.timestamp += 1000);
     for user in users.iter() {
-        client.accrue_interest(user);
+        client.accrue_interest(user, &0);
     }
     sum_balances = users.iter().map(|u| client.get_balance(u)).sum();
     assert_eq!(client.get_total_locked(), sum_balances);
 
     // Checkpoint 3: Partial and full withdrawals
     // User 0 partial withdrawal (unlock_time has passed)
-    client.withdraw(&users[0], &50_0000000i128);
+    client.withdraw(&users[0], &0, &50_0000000i128);
     sum_balances = users.iter().map(|u| client.get_balance(u)).sum();
     assert_eq!(client.get_total_locked(), sum_balances);
 
     // User 1 partial withdrawal
-    client.withdraw(&users[1], &100_0000000i128);
+    client.withdraw(&users[1], &0, &100_0000000i128);
     sum_balances = users.iter().map(|u| client.get_balance(u)).sum();
     assert_eq!(client.get_total_locked(), sum_balances);
 
@@ -826,7 +895,7 @@ fn test_invariant_sum_vault_balances_equals_total_locked() {
     client.deposit(&users[2], &extra_deposit, &new_unlock);
 
     env.ledger().with_mut(|li| li.timestamp += 500);
-    client.accrue_interest(&users[2]);
+    client.accrue_interest(&users[2], &1); // the extra deposit's vault
 
     sum_balances = users.iter().map(|u| client.get_balance(u)).sum();
     assert_eq!(client.get_total_locked(), sum_balances);

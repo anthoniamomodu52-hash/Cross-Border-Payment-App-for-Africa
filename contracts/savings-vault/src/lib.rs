@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec};
 
 mod test;
 
@@ -7,6 +7,7 @@ mod test;
 #[contracttype]
 pub struct DepositEvent {
     pub user: Address,
+    pub vault_id: u32,
     pub amount: i128,
     pub unlock_time: u64,
 }
@@ -15,6 +16,7 @@ pub struct DepositEvent {
 #[contracttype]
 pub struct WithdrawalEvent {
     pub user: Address,
+    pub vault_id: u32,
     pub amount: i128,
     pub penalty: i128,
 }
@@ -23,6 +25,7 @@ pub struct WithdrawalEvent {
 #[contracttype]
 pub struct AccrueInterestEvent {
     pub user: Address,
+    pub vault_id: u32,
     pub interest: i128,
     pub new_balance: i128,
 }
@@ -101,6 +104,8 @@ pub struct LockBoundsUpdated {
     pub new_max: u64,
 }
 
+/// One independent savings position. A user may hold several, each with its
+/// own unlock time (mirrors the backend's `savings_vaults` rows).
 #[derive(Clone)]
 #[contracttype]
 pub struct Vault {
@@ -116,7 +121,12 @@ pub enum DataKey {
     TokenAddress,
     InterestRateBps,
     PenaltyBps,
-    Vault(Address),
+    /// (owner, vault_id) -> Vault
+    Vault(Address, u32),
+    /// owner -> next vault_id to assign
+    NextVaultId(Address),
+    /// owner -> ids of the owner's open vaults
+    UserVaults(Address),
     TotalLocked,
     YieldAccrued(Address),
     YieldDistributor,
@@ -263,6 +273,92 @@ impl SavingsVaultContract {
                 new_reserve,
             },
         );
+    }
+
+    fn load_vault(env: &Env, user: &Address, vault_id: u32) -> Vault {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Vault(user.clone(), vault_id))
+            .expect("No vault found for user")
+    }
+
+    fn save_vault(env: &Env, user: &Address, vault_id: u32, vault: &Vault) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Vault(user.clone(), vault_id), vault);
+    }
+
+    fn user_vault_ids(env: &Env, user: &Address) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserVaults(user.clone()))
+            .unwrap_or(Vec::new(env))
+    }
+
+    /// Delete a vault and drop its id from the owner's list.
+    fn remove_vault(env: &Env, user: &Address, vault_id: u32) {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Vault(user.clone(), vault_id));
+        let mut ids = Self::user_vault_ids(env, user);
+        if let Some(idx) = ids.first_index_of(vault_id) {
+            ids.remove(idx);
+        }
+        if ids.is_empty() {
+            env.storage().persistent().remove(&DataKey::UserVaults(user.clone()));
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::UserVaults(user.clone()), &ids);
+        }
+    }
+
+    /// Emergency wind-down: close every vault `user` holds, send them the
+    /// combined principal and return the amount paid.
+    fn close_all_vaults(env: &Env, user: &Address, empty_msg: &str) -> i128 {
+        let ids = Self::user_vault_ids(env, user);
+        if ids.is_empty() {
+            panic!("No vault found for user");
+        }
+        let mut principal: i128 = 0;
+        for id in ids.iter() {
+            let vault = Self::load_vault(env, user, id);
+            principal = principal
+                .checked_add(vault.balance)
+                .expect("vault balance overflow");
+        }
+        if principal <= 0 {
+            panic!("{}", empty_msg);
+        }
+
+        let token_address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokenAddress)
+            .expect("Contract not initialized");
+        token::Client::new(env, &token_address).transfer(
+            &env.current_contract_address(),
+            user,
+            &principal,
+        );
+
+        for id in ids.iter() {
+            env.storage().persistent().remove(&DataKey::Vault(user.clone(), id));
+        }
+        env.storage().persistent().remove(&DataKey::UserVaults(user.clone()));
+
+        let total_locked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalLocked)
+            .unwrap_or(0);
+        let new_total = total_locked
+            .checked_sub(principal)
+            .expect("total locked underflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalLocked, &new_total);
+        principal
     }
 
     fn get_interest_reserve(env: &Env) -> i128 {
@@ -436,36 +532,7 @@ impl SavingsVaultContract {
             panic!("emergency withdrawal not yet allowed");
         }
 
-        let vault_key = DataKey::Vault(user.clone());
-        let vault: Vault = env.storage().persistent().get(&vault_key).expect("No vault found for user");
-        if vault.balance <= 0 {
-            panic!("No balance to withdraw");
-        }
-
-        let amount = vault.balance;
-        let token_address: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TokenAddress)
-            .expect("Contract not initialized");
-
-        token::Client::new(&env, &token_address).transfer(
-            &env.current_contract_address(),
-            &user,
-            &amount,
-        );
-
-        env.storage().persistent().remove(&vault_key);
-
-        let total_locked: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TotalLocked)
-            .unwrap_or(0);
-        let new_total = total_locked.checked_sub(amount).expect("total locked underflow");
-        env.storage()
-            .persistent()
-            .set(&DataKey::TotalLocked, &new_total);
+        let amount = Self::close_all_vaults(&env, &user, "No balance to withdraw");
 
         env.events().publish(
             (Symbol::new(&env, "EmergencyWithdrawn"),),
@@ -588,30 +655,7 @@ impl SavingsVaultContract {
         if now < activated_at.saturating_add(172_800) {
             panic!("emergency return not yet allowed: 48h not elapsed");
         }
-        let vault_key = DataKey::Vault(user.clone());
-        let vault: Vault = env.storage().persistent().get(&vault_key).expect("No vault found for user");
-        if vault.balance <= 0 {
-            panic!("No balance to return");
-        }
-        let amount = vault.balance;
-        let token_address: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TokenAddress)
-            .expect("Contract not initialized");
-        token::Client::new(&env, &token_address).transfer(
-            &env.current_contract_address(),
-            &user,
-            &amount,
-        );
-        env.storage().persistent().remove(&vault_key);
-        let total_locked: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TotalLocked)
-            .unwrap_or(0);
-        let new_total = total_locked.checked_sub(amount).expect("total locked underflow");
-        env.storage().persistent().set(&DataKey::TotalLocked, &new_total);
+        let amount = Self::close_all_vaults(&env, &user, "No balance to return");
         env.events().publish(
             (Symbol::new(&env, "EmergencyFundsReturned"),),
             EmergencyWithdrawnEvent { admin, user, amount, timestamp: now },
@@ -623,24 +667,19 @@ impl SavingsVaultContract {
     /// Calculates interest = balance * rate_bps * elapsed_seconds / (10000 * seconds_per_year)
     /// and credits it to the vault's internal balance. The contract must hold sufficient
     /// USDC to cover the increased balance when the user later withdraws.
-    pub fn accrue_interest(env: Env, user: Address) {
+    pub fn accrue_interest(env: Env, user: Address, vault_id: u32) {
         user.require_auth();
-        let mut vault: Vault = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Vault(user.clone()))
-            .expect("No vault found for user");
+        let mut vault = Self::load_vault(&env, &user, vault_id);
 
         let interest = Self::accrue_interest_internal(&env, &mut vault, true);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Vault(user.clone()), &vault);
+        Self::save_vault(&env, &user, vault_id, &vault);
 
         if interest > 0 {
             env.events().publish(
                 (Symbol::new(&env, "AccrueInterest"),),
                 AccrueInterestEvent {
                     user,
+                    vault_id,
                     interest,
                     new_balance: vault.balance,
                 },
@@ -655,9 +694,12 @@ impl SavingsVaultContract {
             .unwrap_or(0u32)
     }
 
-    /// Deposit tokens into the vault. Accumulates on top of any existing balance.
-    /// Extends the unlock time only if the new unlock_time is later than the current one.
-    pub fn deposit(env: Env, user: Address, amount: i128, unlock_time: u64) {
+    /// Open a new, independent savings vault for `user` holding `amount` until
+    /// `unlock_time`. Returns the new vault's id.
+    ///
+    /// Each deposit is its own vault: it never changes the unlock time (or
+    /// penalty exposure) of funds the user already has in other vaults.
+    pub fn deposit(env: Env, user: Address, amount: i128, unlock_time: u64) -> u32 {
         user.require_auth();
         if amount <= 0 {
             panic!("Amount must be positive");
@@ -693,29 +735,29 @@ impl SavingsVaultContract {
             &amount,
         );
 
-        let now = env.ledger().timestamp();
-        let mut vault = env
+        let vault_id: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::Vault(user.clone()))
-            .unwrap_or(Vault {
-                balance: 0,
-                unlock_time: 0,
-                last_accrue_time: now,
-                accrued_interest: 0,
-            });
-
-        vault.balance = vault.balance.checked_add(amount).expect("vault balance overflow");
-        if vault.balance > MAX_DEPOSIT_AMOUNT {
-            panic!("Vault balance exceeds maximum bound");
-        }
-        if unlock_time > vault.unlock_time {
-            vault.unlock_time = unlock_time;
-        }
-
+            .get(&DataKey::NextVaultId(user.clone()))
+            .unwrap_or(0);
+        let next_id = vault_id.checked_add(1).expect("vault id overflow");
         env.storage()
             .persistent()
-            .set(&DataKey::Vault(user.clone()), &vault);
+            .set(&DataKey::NextVaultId(user.clone()), &next_id);
+
+        let vault = Vault {
+            balance: amount,
+            unlock_time,
+            last_accrue_time: now,
+            accrued_interest: 0,
+        };
+        Self::save_vault(&env, &user, vault_id, &vault);
+
+        let mut ids = Self::user_vault_ids(&env, &user);
+        ids.push_back(vault_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserVaults(user.clone()), &ids);
 
         // Update total locked
         let total_locked: i128 = env
@@ -732,23 +774,23 @@ impl SavingsVaultContract {
             (Symbol::new(&env, "Deposit"),),
             DepositEvent {
                 user,
+                vault_id,
                 amount,
-                unlock_time: vault.unlock_time,
+                unlock_time,
             },
         );
+        vault_id
     }
 
-    pub fn withdraw(env: Env, user: Address, amount: i128) {
+    /// Withdraw `amount` of principal from one vault. The early-withdrawal
+    /// penalty applies only if *this* vault is still locked.
+    pub fn withdraw(env: Env, user: Address, vault_id: u32, amount: i128) {
         user.require_auth();
         if amount <= 0 {
             panic!("Amount must be positive");
         }
 
-        let mut vault: Vault = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Vault(user.clone()))
-            .expect("No vault found for user");
+        let mut vault = Self::load_vault(&env, &user, vault_id);
 
         if vault.balance < amount {
             panic!("Insufficient balance");
@@ -793,9 +835,11 @@ impl SavingsVaultContract {
             .balance
             .checked_sub(amount)
             .expect("vault balance underflow");
-        env.storage()
-            .persistent()
-            .set(&DataKey::Vault(user.clone()), &vault);
+        if vault.balance == 0 && vault.accrued_interest == 0 {
+            Self::remove_vault(&env, &user, vault_id);
+        } else {
+            Self::save_vault(&env, &user, vault_id, &vault);
+        }
 
         // Update total locked
         let total_locked: i128 = env
@@ -814,33 +858,41 @@ impl SavingsVaultContract {
             (Symbol::new(&env, "Withdrawal"),),
             WithdrawalEvent {
                 user,
+                vault_id,
                 amount: withdraw_amount,
                 penalty,
             },
         );
     }
 
+    /// Total principal `user` holds across all of their vaults.
     pub fn get_balance(env: Env, user: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Vault(user))
-            .map(|v: Vault| v.balance)
-            .unwrap_or(0)
+        let mut total: i128 = 0;
+        for id in Self::user_vault_ids(&env, &user).iter() {
+            let vault: Vault = Self::load_vault(&env, &user, id);
+            total = total.checked_add(vault.balance).expect("balance overflow");
+        }
+        total
     }
 
-    pub fn get_unlock_time(env: Env, user: Address) -> u64 {
+    /// Ids of `user`'s open vaults, in creation order.
+    pub fn get_vault_ids(env: Env, user: Address) -> Vec<u32> {
+        Self::user_vault_ids(&env, &user)
+    }
+
+    pub fn get_unlock_time(env: Env, user: Address, vault_id: u32) -> u64 {
         env.storage()
             .persistent()
-            .get(&DataKey::Vault(user))
+            .get(&DataKey::Vault(user, vault_id))
             .map(|v: Vault| v.unlock_time)
             .unwrap_or(0)
     }
 
-    /// Returns the full vault state for a user, or a zero-valued Vault if none exists.
-    pub fn get_vault(env: Env, user: Address) -> Vault {
+    /// Returns the full state of one vault, or a zero-valued Vault if it doesn't exist.
+    pub fn get_vault(env: Env, user: Address, vault_id: u32) -> Vault {
         env.storage()
             .persistent()
-            .get(&DataKey::Vault(user))
+            .get(&DataKey::Vault(user, vault_id))
             .unwrap_or(Vault {
                 balance: 0,
                 unlock_time: 0,
