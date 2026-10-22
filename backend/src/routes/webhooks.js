@@ -1,9 +1,10 @@
 const router = require('express').Router();
 const authMiddleware = require('../middleware/auth');
-const { create, list, listDeliveries, retry, rotateSecret } = require('../controllers/webhookController');
-const { create, update, list, listDeliveries, retry } = require('../controllers/webhookController');
+const { readLimiter } = require('../middleware/rateLimiter');
+const { create, update, list, listDeliveries, retry, rotateSecret } = require('../controllers/webhookController');
 
 router.use(authMiddleware);
+router.use(readLimiter);
 
 router.post('/', create);
 router.put('/:id', update);

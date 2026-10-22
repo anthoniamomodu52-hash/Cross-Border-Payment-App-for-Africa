@@ -16,6 +16,8 @@ const validate = (req, res, next) => {
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
   next();
 };
+const { readLimiter } = require('../middleware/rateLimiter');
+const { importContacts, getImportTemplate } = require('../controllers/contactsController');
 
 // ---------------------------------------------------------------------------
 // Multer: in-memory storage, CSV files only, 5 MB size limit.
@@ -50,6 +52,7 @@ function csvUploadMiddleware(req, res, next) {
 }
 
 router.use(authMiddleware);
+router.use(readLimiter);
 
 // CRUD — GET/POST /api/contacts, DELETE /api/contacts/:id
 router.get('/', getContacts);

@@ -1,16 +1,25 @@
+import React, { useEffect, useState } from 'react';
 import React, { useState, useEffect } from 'react';
 import { useNavigate, useSearchParams, Link } from 'react-router-dom';
 import toast from 'react-hot-toast';
 import { Eye, EyeOff, ArrowLeft, Check, X, AlertCircle, Clock } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import api from '../utils/api';
-import { getPasswordStrength, getPasswordError } from '../utils/passwordValidator';
+import { getPasswordStrength, getPasswordError, getPasswordChecklist } from '../utils/passwordValidator';
+import { usePasswordPolicy } from '../hooks/usePasswordPolicy';
 
 export default function ResetPassword() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { t } = useTranslation();
-  const tokenFromUrl = searchParams.get('token') || '';
+  // Read the token once, then strip it from the address bar so it doesn't linger in history/Referer
+  const [tokenFromUrl] = useState(() => searchParams.get('token') || '');
+
+  useEffect(() => {
+    if (searchParams.get('token')) {
+      window.history.replaceState(window.history.state, '', window.location.pathname);
+    }
+  }, [searchParams]);
 
   const [password, setPassword] = useState('');
   const [showPass, setShowPass] = useState(false);
@@ -63,8 +72,12 @@ export default function ResetPassword() {
     return () => clearInterval(id);
   }, [tokenStatus, expiresAt]);
 
-  const strength = getPasswordStrength(password);
-  const passwordError = touched ? getPasswordError(password) : '';
+  // Strength checks derive from the backend password policy (single source of
+  // truth) so the reset form enforces exactly what /reset-password enforces.
+  const policy = usePasswordPolicy();
+  const strength = getPasswordStrength(password, policy);
+  const passwordError = touched ? getPasswordError(password, policy) : '';
+  const checklist = getPasswordChecklist(policy);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -146,7 +159,7 @@ export default function ResetPassword() {
                     id="reset-password-new"
                     type={showPass ? 'text' : 'password'}
                     required
-                    minLength={8}
+                    minLength={policy.min_length}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     onBlur={() => setTouched(true)}
@@ -181,13 +194,7 @@ export default function ResetPassword() {
                     </div>
                     <p className={`text-xs font-medium capitalize ${strength.textColor}`}>{strength.label}</p>
                     <ul className="space-y-1">
-                      {[
-                        { key: 'length', label: 'At least 8 characters' },
-                        { key: 'uppercase', label: 'One uppercase letter' },
-                        { key: 'lowercase', label: 'One lowercase letter' },
-                        { key: 'number', label: 'One number' },
-                        { key: 'special', label: 'One special character' },
-                      ].map(({ key, label }) => (
+                      {checklist.map(({ key, label }) => (
                         <li key={key} className={`flex items-center gap-1.5 text-xs ${strength.checks[key] ? 'text-green-500' : 'text-gray-500'}`}>
                           {strength.checks[key] ? <Check size={12} aria-hidden="true" /> : <X size={12} aria-hidden="true" />} {label}
                         </li>
