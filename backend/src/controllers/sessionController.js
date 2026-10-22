@@ -3,6 +3,7 @@ const db = require('../db');
 const logger = require('../utils/logger');
 const cache = require('../utils/cache');
 const geoip = require('geoip-lite');
+const { disconnectJti } = require('../services/socketRegistry');
 
 const SESSION_CAP = 5;
 const TOUCH_DEBOUNCE_SEC = 5 * 60; // 5 minutes
@@ -38,6 +39,7 @@ function getClientIp(req) {
 async function blacklistJti(jti, ttlSeconds) {
   if (!jti) return;
   await cache.set(`jti:blacklist:${jti}`, 1, ttlSeconds || TOUCH_DEBOUNCE_SEC).catch(() => {});
+  disconnectJti(jti);
 }
 
 async function isJtiBlacklisted(jti) {

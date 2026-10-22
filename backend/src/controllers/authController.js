@@ -34,6 +34,7 @@ const {
 
 const { sendOTP } = require('../services/sms');
 const { recordSession, invalidateOtherSessions } = require('./sessionController');
+const { disconnectJti, disconnectUser } = require('../services/socketRegistry');
 
 const TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours — email verification tokens
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
@@ -475,6 +476,7 @@ async function logout(req, res, next) {
         }
       }
     }
+    disconnectJti(req.user?.jti);
     res.clearCookie(COOKIE_NAME, { ...COOKIE_OPTIONS, maxAge: undefined });
     res.json({ message: 'Logged out successfully' });
   } catch (err) {
@@ -1019,6 +1021,7 @@ async function resetPassword(req, res, next) {
       client.release();
     }
 
+    disconnectUser(userId);
     audit.log(userId, 'password_change', req.ip, req.headers['user-agent']);
     audit.log(userId, 'password_reset_sessions_invalidated', req.ip, req.headers['user-agent']);
     res.json({ message: 'Password has been reset. You can now log in.' });
