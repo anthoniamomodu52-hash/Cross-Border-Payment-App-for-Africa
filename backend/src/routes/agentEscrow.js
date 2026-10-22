@@ -2,6 +2,7 @@ const router = require("express").Router();
 const { body, param, query, validationResult } = require("express-validator");
 const StellarSdk = require("@stellar/stellar-sdk");
 const authMiddleware = require("../middleware/auth");
+const { requireStepUp } = require("../middleware/requireStepUp");
 const idempotency = require("../middleware/idempotency");
 const { create, confirm, cancel, getEscrow, listEscrows } = require("../controllers/agentEscrowController");
 
@@ -47,6 +48,7 @@ router.get(
 router.post(
   "/create",
   idempotency,
+  requireStepUp,
   [
     body("agent_wallet").notEmpty().custom(isValidAddress),
     body("recipient_wallet").notEmpty().custom(isValidAddress),
@@ -59,6 +61,7 @@ router.post(
 
 router.post(
   "/:id/confirm-payout",
+  requireStepUp,
   [param("id").isUUID().withMessage("Invalid escrow ID")],
   validate,
   confirm
@@ -67,6 +70,7 @@ router.post(
 // Legacy alias kept for backward compatibility
 router.post(
   "/:id/confirm",
+  requireStepUp,
   [param("id").isUUID().withMessage("Invalid escrow ID")],
   validate,
   confirm
@@ -74,6 +78,7 @@ router.post(
 
 router.post(
   "/:id/cancel",
+  requireStepUp,
   [param("id").isUUID().withMessage("Invalid escrow ID")],
   validate,
   cancel

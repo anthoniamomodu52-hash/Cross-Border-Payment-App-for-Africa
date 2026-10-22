@@ -176,6 +176,46 @@ async function checkSufficientBalance(publicKey, amount, asset) {
   }
 }
 
+async function checkPaymentPreflight(publicKey, amount, asset) {
+  const overLimit = await dailyLimitExceeded(publicKey, amount, asset);
+  if (overLimit) {
+    throw Object.assign(new Error(`Daily send limit of ${DAILY_SEND_LIMIT} reached. Try again tomorrow.`), {
+      status: 400, payload: { code: "DAILY_LIMIT_EXCEEDED" },
+    });
+  }
+
+  const [isSuspicious, limitExceeded] = await Promise.all([
+    checkVelocity(publicKey),
+    checkDailyLimit(publicKey, amount, asset),
+  ]);
+  if (isSuspicious) {
+    throw Object.assign(new Error("Transaction limit reached. Please wait before sending again."), { status: 429 });
+  }
+
+  const fraudCheck = await checkFraud(publicKey, amount, asset);
+  if (fraudCheck.blocked) {
+    await logFraudBlock(publicKey, fraudCheck.reason, amount, asset);
+    throw Object.assign(new Error(fraudCheck.reason), { status: 429 });
+  }
+  if (limitExceeded) {
+    throw Object.assign(new Error("Daily send limit reached. Try again later."), {
+      status: 429, payload: { code: "DAILY_LIMIT_EXCEEDED" },
+    });
+  }
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  let nextIndex = 0;
+  const workerCount = Math.min(items.length, concurrency);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      await mapper(items[index], index);
+    }
+  }));
+}
+
 async function ensureKycIfNeeded(userId, amount, asset) {
   const estimatedUSD = estimateUSDValue(amount, asset);
   if (estimatedUSD < KYC_THRESHOLD_USD) return null;
@@ -453,35 +493,11 @@ async function send(req, res, next) {
     const lockKey = `daily_limit:${public_key}`;
     let txResult;
     const lockAcquired = await withLock(lockKey, 10, async () => {
-      const overLimit = await dailyLimitExceeded(public_key, amount, asset);
-      if (overLimit) {
-        throw Object.assign(new Error(`Daily send limit of ${DAILY_SEND_LIMIT} reached. Try again tomorrow.`), {
-          status: 400, payload: { code: "DAILY_LIMIT_EXCEEDED" },
-        });
-      }
-
-      // Fraud protection — velocity and daily limit (single authoritative check)
-      const [isSuspicious, limitExceeded] = await Promise.all([
-        checkVelocity(public_key),
-        checkDailyLimit(public_key, amount, asset),
-      ]);
-      if (isSuspicious) {
-        throw Object.assign(new Error("Transaction limit reached. Please wait before sending again."), { status: 429 });
-      }
-      const fraudCheck = await checkFraud(public_key, amount, asset);
-      if (fraudCheck.blocked) {
-        await logFraudBlock(public_key, fraudCheck.reason, amount, asset);
-        throw Object.assign(new Error(fraudCheck.reason), { status: 429 });
-      }
+      await checkPaymentPreflight(public_key, amount, asset);
 
       if (await isMemoRequired(recipient_address) && !memo) {
         throw Object.assign(new Error("This address requires a memo to route your payment correctly. Please include a memo."), {
           status: 422, payload: { code: "MEMO_REQUIRED" },
-        });
-      }
-      if (limitExceeded) {
-        throw Object.assign(new Error("Daily send limit reached. Try again later."), {
-          status: 429, payload: { code: "DAILY_LIMIT_EXCEEDED" },
         });
       }
 
@@ -678,19 +694,20 @@ async function sendBatch(req, res, next) {
     // AML re-screen for high-value batches — fail closed when screening is unavailable
     await amlRescreenForPayment(req.user.userId, public_key, estimateUSDValue(totalAmount, asset));
 
-    const overLimit = await dailyLimitExceeded(public_key, totalAmount, asset);
-    if (overLimit) {
-      return res.status(400).json({
-        error: `Daily send limit of ${DAILY_SEND_LIMIT} reached. Try again tomorrow.`,
-        code: "DAILY_LIMIT_EXCEEDED",
+    const memoRequiredByAddress = new Map();
+    if (!memo) {
+      const memoAddresses = [...new Set(recipients
+        .map((recipient) => recipient.recipient_address)
+        .filter((address) => address !== public_key))];
+      await mapWithConcurrency(memoAddresses, 5, async (address) => {
+        memoRequiredByAddress.set(address, await isMemoRequired(address));
       });
     }
 
-    const fraudCheck = await checkFraud(public_key, totalAmount, asset);
-    if (fraudCheck.blocked) {
-      await logFraudBlock(public_key, fraudCheck.reason, totalAmount, asset);
-      return res.status(429).json({ error: fraudCheck.reason });
-    }
+    const lockKey = `daily_limit:${public_key}`;
+    const lockAcquired = await withLock(lockKey, 10, async () => {
+      await checkPaymentPreflight(public_key, totalAmount, asset);
+      await checkSufficientBalance(public_key, totalAmount, asset);
 
     const results = [];
     const validRecipients = [];
@@ -705,7 +722,7 @@ async function sendBatch(req, res, next) {
         continue;
       }
 
-      if (await isMemoRequired(recipientAddress) && !memo) {
+      if (memoRequiredByAddress.get(recipientAddress) && !memo) {
         results.push({ index, recipient_address: recipientAddress, amount, status: "failed", error: "This address requires a memo.", code: "MEMO_REQUIRED" });
         continue;
       }
@@ -785,6 +802,14 @@ async function sendBatch(req, res, next) {
         details: err.response?.data?.extras,
         summary: { total: recipients.length, submitted: validRecipients.length, successful: 0, failed: results.length },
         results,
+      });
+    }
+    });
+
+    if (!lockAcquired) {
+      return res.status(429).json({
+        error: "Too many concurrent payment requests. Please try again.",
+        code: "CONCURRENCY_LIMIT",
       });
     }
   } catch (err) {

@@ -3,6 +3,7 @@ const { body, query, validationResult } = require("express-validator");
 const rateLimit = require("express-rate-limit");
 const StellarSdk = require("@stellar/stellar-sdk");
 const authMiddleware = require("../middleware/auth");
+const { requireStepUp } = require("../middleware/requireStepUp");
 const { readLimiter, paymentLimiter } = require("../middleware/rateLimiter");
 const idempotency = require("../middleware/idempotency");
 const paymentSendValidators = require("../validators/paymentSendValidators");
@@ -104,13 +105,13 @@ router.get("/fee-rate", getFeeRate);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post("/send", paymentLimiter, paymentSendValidators, validate, idempotency, send);
+router.post("/send", paymentLimiter, paymentSendValidators, validate, idempotency, requireStepUp, send);
 
 /**
  * POST /api/payments/batch
  * @protected @idempotent
  */
-router.post("/batch", paymentBatchValidators, validate, idempotency, sendBatch);
+router.post("/batch", paymentBatchValidators, validate, idempotency, requireStepUp, sendBatch);
 
 // Federation address resolution
 router.get(
@@ -264,6 +265,7 @@ router.post(
   ],
   validate,
   idempotency,
+  requireStepUp,
   sendPath,
 );
 
@@ -305,6 +307,7 @@ router.post(
   ],
   validate,
   idempotency,
+  requireStepUp,
   sendStrictReceivePath,
 );
 
@@ -329,6 +332,7 @@ router.post(
   [body("xdr").notEmpty().withMessage("Signed XDR is required")],
   validate,
   idempotency,
+  requireStepUp,
   submitSigned,
 );
 
@@ -346,6 +350,7 @@ router.post(
   [
     require("express-validator").param("id").isUUID().withMessage("id must be a valid UUID"),
     validate,
+    requireStepUp,
   ],
   cancelPendingEscrow,
 );
