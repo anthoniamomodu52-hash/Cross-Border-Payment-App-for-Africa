@@ -17,6 +17,7 @@ mod test;
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -36,7 +37,7 @@ pub enum DataKey {
 // ── Domain types ──────────────────────────────────────────────────────────────
 
 /// Status of an agent escrow.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[contracttype]
 pub enum EscrowStatus {
     /// Awaiting agent payout confirmation.
@@ -48,7 +49,7 @@ pub enum EscrowStatus {
 }
 
 /// On-chain record for a single agent escrow.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct AgentEscrow {
     pub id: u64,
@@ -70,7 +71,7 @@ pub struct AgentEscrow {
 // ── Event payloads ────────────────────────────────────────────────────────────
 
 /// Emitted by `create_escrow`. Topics: ("AgentEscrow", "EscrowCreated").
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtEscrowCreated {
     pub escrow_id: u64,
@@ -83,7 +84,7 @@ pub struct EvtEscrowCreated {
 
 /// Emitted by `confirm_payout` and `admin_release` (to_agent=true).
 /// Topics: ("AgentEscrow", "EscrowConfirmed").
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtEscrowConfirmed {
     pub escrow_id: u64,
@@ -94,7 +95,7 @@ pub struct EvtEscrowConfirmed {
 
 /// Emitted by `cancel_escrow` and `admin_release` (to_agent=false).
 /// Topics: ("AgentEscrow", "EscrowCancelled").
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtEscrowCancelled {
     pub escrow_id: u64,
@@ -104,7 +105,7 @@ pub struct EvtEscrowCancelled {
 
 /// Emitted by `admin_release` in addition to the outcome event.
 /// Topics: ("AgentEscrow", "AdminOverride").
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct AdminOverride {
     pub escrow_id: u64,
@@ -114,26 +115,26 @@ pub struct AdminOverride {
     pub reason: Symbol,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct InsuranceFundContribution {
     pub escrow_id: u64,
     pub amount: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtAgentRegistered {
     pub agent: Address,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtAgentRemoved {
     pub agent: Address,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct InsurancePayout {
     pub escrow_id: u64,
@@ -141,7 +142,7 @@ pub struct InsurancePayout {
     pub amount: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtPartialPayoutReleased {
     pub escrow_id: u64,

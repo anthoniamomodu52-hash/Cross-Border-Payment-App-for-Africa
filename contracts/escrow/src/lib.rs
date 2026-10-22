@@ -6,7 +6,7 @@ mod test;
 /// Semantic version of this contract. Bumped on every upgrade.
 pub const CONTRACT_VERSION: u32 = 3;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EscrowCreated {
     pub escrow_id: u64,
@@ -17,7 +17,7 @@ pub struct EscrowCreated {
     pub release_fee_bps: u32,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EscrowReleased {
     pub escrow_id: u64,
@@ -25,7 +25,7 @@ pub struct EscrowReleased {
     pub fee_amount: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EscrowPartiallyReleased {
     pub escrow_id: u64,
@@ -35,14 +35,14 @@ pub struct EscrowPartiallyReleased {
     pub remaining_amount: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EscrowCancelled {
     pub escrow_id: u64,
     pub refund_amount: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EscrowExpired {
     pub escrow_id: u64,
@@ -50,7 +50,7 @@ pub struct EscrowExpired {
     pub refund_amount: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EscrowBatchCreated {
     pub batch_size: u32,
@@ -59,7 +59,7 @@ pub struct EscrowBatchCreated {
     pub total_amount: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EscrowParams {
     pub recipient: Address,
@@ -68,14 +68,14 @@ pub struct EscrowParams {
     pub release_fee_bps: u32,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct DeliveryConfirmed {
     pub escrow_id: u64,
     pub agent: Address,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct PartialRelease {
     pub escrow_id: u64,
@@ -84,20 +84,20 @@ pub struct PartialRelease {
     pub fee_amount: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EscrowArchived {
     pub escrow_id: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct Upgraded {
     pub new_wasm_hash: BytesN<32>,
     pub contract_version: u32,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct Migrated {
     pub contract_version: u32,
@@ -110,7 +110,7 @@ pub struct FeesWithdrawn {
     pub amount: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct FeeUpdated {
     pub escrow_id: u64,
@@ -118,7 +118,7 @@ pub struct FeeUpdated {
     pub new_fee_bps: u32,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EscrowDeposited {
     pub escrow_id: u64,
@@ -127,7 +127,7 @@ pub struct EscrowDeposited {
     pub new_total: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EscrowDisputed {
     pub escrow_id: u64,
@@ -136,7 +136,7 @@ pub struct EscrowDisputed {
     pub amount: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct Escrow {
     pub id: u64,
@@ -152,7 +152,7 @@ pub struct Escrow {
     pub expires_at: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[contracttype]
 pub enum EscrowStatus {
     Pending,
@@ -165,6 +165,7 @@ pub enum EscrowStatus {
     UnderDispute,
 }
 
+#[derive(Debug)]
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -223,7 +224,8 @@ fn is_kyc_verified(env: &Env, wallet: &Address) -> bool {
         None => true, // KYC checking disabled
         Some(addr) => {
             // Check if address is zero (all bytes are 0)
-            let zero_addr = Address::from_contract_id(env, &[0u8; 32]);
+            // Strkey of the all-zero contract id.
+            let zero_addr = Address::from_str(env, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4");
             if addr == zero_addr {
                 true // KYC checking disabled
             } else {

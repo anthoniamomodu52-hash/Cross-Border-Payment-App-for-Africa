@@ -1,10 +1,11 @@
 #![cfg(test)]
+extern crate std;
 
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger, LedgerInfo},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
+    Address, Env, TryFromVal,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -19,12 +20,12 @@ fn setup_with_fee(fee_bps: u32) -> (Env, Address, Address, Address, Address, Add
 
     // Deploy a mock USDC token
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract(token_admin.clone());
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
 
     let admin = Address::generate(&env);
 
     // Deploy the recurring-payments contract
-    let contract_id = env.register_contract(None, RecurringPaymentsContract);
+    let contract_id = env.register(RecurringPaymentsContract, ());
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
     client.initialize(&admin, &token_id, &fee_bps);
 
@@ -65,9 +66,9 @@ fn test_initialize_ok() {
     let env = Env::default();
     env.mock_all_auths();
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract(token_admin);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
     let admin = Address::generate(&env);
-    let contract_id = env.register_contract(None, RecurringPaymentsContract);
+    let contract_id = env.register(RecurringPaymentsContract, ());
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
     client.initialize(&admin, &token_id, &0); // must not panic
 }
@@ -87,9 +88,9 @@ fn test_initialize_fee_bps_too_high_panics() {
     let env = Env::default();
     env.mock_all_auths();
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract(token_admin);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
     let admin = Address::generate(&env);
-    let contract_id = env.register_contract(None, RecurringPaymentsContract);
+    let contract_id = env.register(RecurringPaymentsContract, ());
     RecurringPaymentsContractClient::new(&env, &contract_id).initialize(&admin, &token_id, &10_001);
 }
 
@@ -321,6 +322,8 @@ fn test_resume_allows_execution() {
     client.pause_recurring_payment(&sender, &id);
     advance_time(&env, 86400);
     client.resume_recurring_payment(&sender, &id);
+    // Resuming restarts the interval, so the next payment is due one interval later.
+    advance_time(&env, 86400);
     client.execute_payment(&executor, &id);
     assert_eq!(token_balance(&env, &token_id, &recipient), amount);
 }
@@ -521,11 +524,10 @@ fn test_execute_within_grace_period_succeeds() {
     assert_eq!(client.get_recurring_payment(&id).consecutive_misses, 0);
 }
 
-/// Acceptance criterion 2: execution after grace period panics with the
-/// correct message.
+/// Acceptance criterion 2: execution after the grace period records a miss
+/// instead of paying. (It returns normally: a panic would roll back the miss.)
 #[test]
-#[should_panic(expected = "Execution window and grace period have both passed")]
-fn test_execute_after_grace_period_panics() {
+fn test_execute_after_grace_period_records_miss() {
     let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
     let amount = 200_0000000i128;
@@ -537,8 +539,9 @@ fn test_execute_after_grace_period_panics() {
     // Advance past next_payment_at AND the full grace window
     advance_time(&env, 86400 + grace + 1);
 
-    // Must panic because both the execution window and grace period have passed
     client.execute_payment(&executor, &id);
+    assert_eq!(client.get_missed_executions(&id), 1);
+    assert_eq!(token_balance(&env, &token_id, &recipient), 0);
 }
 
 /// Acceptance criterion 3: schedule is auto-cancelled after 3 consecutive
@@ -555,37 +558,25 @@ fn test_auto_cancel_after_three_consecutive_misses() {
         &sender, &recipient, &token_id, &amount, &interval, &0, &grace, &max_missed,
     );
 
-    // Miss 1: advance past first window + grace, call execute_payment to trigger miss recording
-    // Each call panics but also records the miss and advances next_payment_at.
-    // We use std::panic::catch_unwind equivalent — in Soroban test env we rely on
-    // the fact that the schedule IS mutated before the panic; so we call the
-    // panicking functions and just verify state afterwards.
+    // Each late execute_payment call records a miss and advances next_payment_at
+    // (it returns normally so the recorded miss is persisted).
 
     // Miss 1
     advance_time(&env, interval + grace + 1);
-    let result1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.execute_payment(&executor, &id);
-    }));
-    assert!(result1.is_err(), "expected panic for miss 1");
+    client.execute_payment(&executor, &id);
     assert_eq!(client.get_missed_executions(&id), 1);
     assert_eq!(client.get_recurring_payment(&id).status, ScheduleStatus::Active);
 
     // Miss 2: the schedule's next_payment_at was advanced by the miss handler;
     // advance past that new window + grace period again.
     advance_time(&env, interval + grace + 1);
-    let result2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.execute_payment(&executor, &id);
-    }));
-    assert!(result2.is_err(), "expected panic for miss 2");
+    client.execute_payment(&executor, &id);
     assert_eq!(client.get_missed_executions(&id), 2);
     assert_eq!(client.get_recurring_payment(&id).status, ScheduleStatus::Active);
 
     // Miss 3: triggers auto-cancel
     advance_time(&env, interval + grace + 1);
-    let result3 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.execute_payment(&executor, &id);
-    }));
-    assert!(result3.is_err(), "expected panic for miss 3");
+    client.execute_payment(&executor, &id);
     assert_eq!(client.get_missed_executions(&id), 3);
     // After 3 consecutive misses the schedule must be Cancelled
     assert_eq!(
@@ -820,13 +811,14 @@ fn test_update_recipient_emits_event_with_old_and_new_addresses() {
 
     let new_recipient = Address::generate(&env);
     client.update_recipient(&sender, &id, &new_recipient);
+    // Events are only kept for the most recent invocation, so read them first.
+    let events = all_events(&env);
 
     // Verify recipient has been updated in schedule
     let schedule = client.get_schedule(&id);
     assert_eq!(schedule.recipient, new_recipient);
 
     // Verify event publication with both old and new addresses for notification
-    let events = env.events().all();
     let mut found_event = false;
     for i in 0..events.len() {
         let (contract, topics, data) = events.get(i).unwrap();
@@ -866,22 +858,19 @@ fn test_consecutive_misses_mix_with_successful_execution_and_counter_accuracy() 
 
     // Miss 1
     advance_time(&env, interval + grace + 1);
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.execute_payment(&executor, &id);
-    }));
+    client.execute_payment(&executor, &id);
     assert_eq!(client.get_missed_executions(&id), 1);
     assert_eq!(client.get_remaining_executions(&id), Some(5));
 
     // Miss 2
     advance_time(&env, interval + grace + 1);
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.execute_payment(&executor, &id);
-    }));
+    client.execute_payment(&executor, &id);
     assert_eq!(client.get_missed_executions(&id), 2);
     assert_eq!(client.get_remaining_executions(&id), Some(5));
 
-    // Now execute successfully in the next window
-    advance_time(&env, interval);
+    // Now execute successfully at the start of the next window
+    let now = env.ledger().timestamp();
+    advance_time(&env, client.get_schedule(&id).next_payment_at - now);
     client.execute_payment(&executor, &id);
 
     // Successful execution must reset consecutive_misses to 0 and reduce remaining executions
@@ -891,10 +880,38 @@ fn test_consecutive_misses_mix_with_successful_execution_and_counter_accuracy() 
 
     // Miss 1 again after reset
     advance_time(&env, interval + grace + 1);
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.execute_payment(&executor, &id);
-    }));
+    client.execute_payment(&executor, &id);
     assert_eq!(client.get_missed_executions(&id), 1);
     assert_eq!(client.get_remaining_executions(&id), Some(4));
 }
 
+/// Events emitted so far, as `(contract, topics, data)` tuples.
+///
+/// soroban-sdk 23+ returns events in XDR form; this converts them back to
+/// host values so tests can decode payloads with `FromVal`.
+#[allow(dead_code)]
+fn all_events(
+    env: &soroban_sdk::Env,
+) -> soroban_sdk::Vec<(
+    soroban_sdk::Address,
+    soroban_sdk::Vec<soroban_sdk::Val>,
+    soroban_sdk::Val,
+)> {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{xdr, Address, TryFromVal, Val, Vec};
+    let mut out = Vec::new(env);
+    for e in env.events().all().events() {
+        let xdr::ContractEventBody::V0(body) = &e.body;
+        let Some(contract_id) = e.contract_id.clone() else {
+            continue;
+        };
+        let contract =
+            Address::try_from_val(env, &xdr::ScAddress::Contract(contract_id)).unwrap();
+        let mut topics: Vec<Val> = Vec::new(env);
+        for t in body.topics.iter() {
+            topics.push_back(Val::try_from_val(env, t).unwrap());
+        }
+        out.push_back((contract, topics, Val::try_from_val(env, &body.data).unwrap()));
+    }
+    out
+}

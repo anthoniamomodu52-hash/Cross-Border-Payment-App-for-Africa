@@ -41,7 +41,7 @@ use soroban_sdk::{
 
 // ── KYC Tier enum ────────────────────────────────────────────────────────────────
 // Replicated from kyc-attestation contract for type safety in cross-contract calls.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 #[contracttype]
 #[repr(u32)]
 pub enum KycTier {
@@ -50,6 +50,7 @@ pub enum KycTier {
     Business = 2,
 }
 
+#[derive(Debug)]
 #[contracttype]
 pub struct AllowanceValue {
     pub amount: i128,
@@ -60,6 +61,7 @@ mod test;
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -85,7 +87,7 @@ pub enum DataKey {
 // ── Tier type ─────────────────────────────────────────────────────────────────
 
 /// A single redemption tier: points required and the fee-discount awarded.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct Tier {
     /// Points the user must hold (and will burn) to redeem this tier.

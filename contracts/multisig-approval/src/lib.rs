@@ -1,5 +1,8 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, crypto::Hash, Address, Bytes, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Symbol,
+    Vec,
+};
 
 mod test;
 
@@ -14,7 +17,7 @@ const DEFAULT_SIGNER_WEIGHT: u32 = 1;
 const MAX_SIGNER_WEIGHT: u32 = 100;
 
 #[contracttype]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxStatus {
     Pending,
     Executed,
@@ -24,7 +27,7 @@ pub enum TxStatus {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Proposal {
     pub proposer: Address,
     pub description: String,
@@ -37,7 +40,7 @@ pub struct Proposal {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct QuorumChangeProposal {
     pub proposer: Address,
     pub new_quorum: u32,
@@ -49,7 +52,7 @@ pub struct QuorumChangeProposal {
 
 /// Whether a pending rotation adds or removes a signer.
 #[contracttype]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotationAction {
     Add,
     Remove,
@@ -57,7 +60,7 @@ pub enum RotationAction {
 
 /// A time-locked signer-rotation request waiting to become effective.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PendingRotation {
     pub action: RotationAction,
     pub signer: Address,
@@ -65,6 +68,7 @@ pub struct PendingRotation {
     pub effective_at: u64,
 }
 
+#[derive(Debug)]
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -85,7 +89,7 @@ pub enum DataKey {
 // ── Signer-rotation event payloads ────────────────────────────────────────────
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct EvtSignerChangeProposed {
     pub action: RotationAction,
     pub signer: Address,
@@ -93,7 +97,7 @@ pub struct EvtSignerChangeProposed {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct EvtSignerChanged {
     pub action: RotationAction,
     pub signer: Address,
@@ -101,7 +105,7 @@ pub struct EvtSignerChanged {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct EvtSignerChangeCancelled {
     pub action: RotationAction,
     pub signer: Address,
@@ -120,7 +124,7 @@ impl MultisigContract {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
-        assert!(quorum > 0 && quorum as usize <= approvers.len(), "invalid quorum");
+        assert!(quorum > 0 && quorum <= approvers.len(), "invalid quorum");
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Approvers, &approvers);
@@ -255,7 +259,7 @@ impl MultisigContract {
         proposer.require_auth();
         Self::assert_is_approver(&env, &proposer);
         let approvers: Vec<Address> = env.storage().instance().get(&DataKey::Approvers).unwrap();
-        assert!(new_quorum > 0 && new_quorum as usize <= approvers.len(), "invalid quorum");
+        assert!(new_quorum > 0 && new_quorum <= approvers.len(), "invalid quorum");
 
         let id: u64 = env.storage().instance().get(&DataKey::QuorumCounter).unwrap();
         let proposal_ttl: u64 = env.storage().instance().get(&DataKey::ProposalTtl).unwrap_or(DEFAULT_PROPOSAL_TTL_SECS);
@@ -582,7 +586,7 @@ impl MultisigContract {
         preimage.append(&Bytes::from_array(&env, &proposal.amount.to_be_bytes()));
         // nonce: use expires_at as unique per-proposal value
         preimage.append(&Bytes::from_array(&env, &proposal.expires_at.to_be_bytes()));
-        env.crypto().sha256(&preimage)
+        env.crypto().sha256(&preimage).into()
     }
 
     /// Execute a proposal using pre-collected off-chain ed25519 signatures.
@@ -624,8 +628,9 @@ impl MultisigContract {
             Self::assert_is_approver(&env, &signer);
 
             // Verify ed25519 signature over the proposal hash
-            let pub_key: BytesN<32> = signer.to_xdr(&env)
-                .slice(signer.to_xdr(&env).len() - 32..)
+            let signer_xdr = signer.clone().to_xdr(&env);
+            let pub_key: BytesN<32> = signer_xdr
+                .slice(signer_xdr.len() - 32..)
                 .try_into()
                 .expect("Invalid signer public key");
             env.crypto().ed25519_verify(&pub_key, &Bytes::from(hash.clone()), &sig);
