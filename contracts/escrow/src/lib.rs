@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, String, Symbol};
 
 mod test;
 
@@ -152,7 +152,7 @@ pub struct Escrow {
     pub expires_at: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[contracttype]
 pub enum EscrowStatus {
     Pending,
@@ -192,6 +192,10 @@ const MIN_ESCROW_AMOUNT: i128 = 100;
 // Intermediate fee calc uses (amount / 10000).saturating_mul(bps) to prevent overflow.
 const MAX_ESCROW_AMOUNT: i128 = 10_000_000_000_000;
 
+/// Strkey of the contract address whose 32 id bytes are all zero. Setting the
+/// KYC contract to this address disables KYC checks.
+const ZERO_CONTRACT_ADDRESS: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
 fn require_admin(env: &Env, admin: &Address) {
     admin.require_auth();
     let stored_admin: Address = env
@@ -222,8 +226,8 @@ fn is_kyc_verified(env: &Env, wallet: &Address) -> bool {
     match kyc_contract {
         None => true, // KYC checking disabled
         Some(addr) => {
-            // Check if address is zero (all bytes are 0)
-            let zero_addr = Address::from_contract_id(env, &[0u8; 32]);
+            // Check if address is the all-zero contract address
+            let zero_addr = Address::from_string(&String::from_str(env, ZERO_CONTRACT_ADDRESS));
             if addr == zero_addr {
                 true // KYC checking disabled
             } else {

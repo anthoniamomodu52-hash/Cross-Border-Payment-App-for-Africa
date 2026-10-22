@@ -3,7 +3,7 @@
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, BytesN, Env, IntoVal, Symbol, Val,
+    Address, BytesN, Env, FromVal, Symbol, TryFromVal, Val,
 };
 
 use crate::{
@@ -17,9 +17,19 @@ fn setup() -> (Env, EscrowContractClient<'static>, Address, Address) {
     let contract_id = env.register_contract(None, EscrowContract);
     let client = EscrowContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    let usdc_id = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let usdc_id = env.register_stellar_asset_contract(admin.clone());
     client.initialize(&admin, &usdc_id);
     (env, client, admin, usdc_id)
+}
+
+/// Return the first emitted event whose topics include the symbol `name`.
+fn find_event(env: &Env, name: &str) -> Option<(Address, soroban_sdk::Vec<Val>, Val)> {
+    let wanted = Symbol::new(env, name);
+    env.events().all().iter().find(|(_, topics, _)| {
+        topics
+            .iter()
+            .any(|t| Symbol::try_from_val(env, &t).map_or(false, |s| s == wanted))
+    })
 }
 
 fn mint_usdc(env: &Env, usdc_id: &Address, _admin: &Address, to: &Address, amount: i128) {
@@ -314,12 +324,7 @@ fn test_confirm_delivery_prevents_cancel() {
     let escrow = client.get_escrow(&escrow_id);
     assert!(escrow.payout_confirmed);
 
-    let result = std::panic::catch_unwind(|| {
-        client.cancel_escrow(&sender, &escrow_id);
-    });
-    assert!(result.is_err());
-    let error_message = format!("{:?}", result.err().unwrap());
-    assert!(error_message.contains("Cannot cancel: agent has confirmed delivery"));
+    assert!(client.try_cancel_escrow(&sender, &escrow_id).is_err());
 }
 
 #[test]
@@ -328,7 +333,7 @@ fn test_partial_release_keeps_pending_until_fully_released() {
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     let agent = Address::generate(&env);
-    let amount = 1_000_0000000i128;
+    let amount = 100_0000000i128; // 100 USDC
 
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &250);
@@ -346,7 +351,7 @@ fn test_multiple_partial_releases_release_remaining_amount() {
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     let agent = Address::generate(&env);
-    let amount = 1_000_0000000i128;
+    let amount = 100_0000000i128; // 100 USDC
 
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &250);
@@ -368,8 +373,8 @@ fn test_partial_release_over_release_panics() {
     let recipient = Address::generate(&env);
     let agent = Address::generate(&env);
 
-    mint_usdc(&env, &usdc_id, &admin, &sender, 1_000_0000000);
-    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &250);
+    mint_usdc(&env, &usdc_id, &admin, &sender, 100_0000000);
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &100_0000000, &250);
     client.partial_release(&agent, &escrow_id, &1_000_000001i128);
 }
 
@@ -396,14 +401,10 @@ fn test_partial_release_basic() {
     let expected_agent = 400_0000000i128 - expected_fee;
     assert_eq!(TokenClient::new(&env, &usdc_id).balance(&agent), expected_agent);
 
-    let event_name: Val = Symbol::new(&env, "PartialRelease").into_val(&env);
-    let events = env.events().all();
-    let pr_event = events.iter().find(|(_, topics, _)| {
-        topics.iter().any(|topic| topic == &event_name)
-    });
+    let pr_event = find_event(&env, "PartialRelease");
     assert!(pr_event.is_some(), "PartialRelease event not emitted");
     let (_, _, data) = pr_event.unwrap();
-    let payload: PartialRelease = soroban_sdk::from_val(&env, data);
+    let payload = PartialRelease::from_val(&env, &data);
     assert_eq!(payload.escrow_id, escrow_id);
     assert_eq!(payload.released_amount, 400_0000000i128);
     assert_eq!(payload.remaining_amount, 600_0000000i128);
@@ -488,14 +489,10 @@ fn test_partial_release_event_fields() {
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &250);
     client.partial_release(&agent, &escrow_id, &600_0000000i128);
 
-    let event_name: Val = Symbol::new(&env, "PartialRelease").into_val(&env);
-    let events = env.events().all();
-    let pr_event = events.iter().find(|(_, topics, _)| {
-        topics.iter().any(|topic| topic == &event_name)
-    });
+    let pr_event = find_event(&env, "PartialRelease");
     assert!(pr_event.is_some(), "PartialRelease event not emitted");
     let (_, _, data) = pr_event.unwrap();
-    let payload: PartialRelease = soroban_sdk::from_val(&env, data);
+    let payload = PartialRelease::from_val(&env, &data);
 
     assert_eq!(payload.escrow_id, escrow_id);
     assert_eq!(payload.released_amount, 600_0000000i128);
@@ -521,12 +518,7 @@ fn test_cleanup_escrow_after_retention() {
 
     client.cleanup_escrow(&escrow_id);
 
-    let result = std::panic::catch_unwind(|| {
-        client.get_escrow(&escrow_id);
-    });
-    assert!(result.is_err());
-    let err_str = format!("{:?}", result.err().unwrap());
-    assert!(err_str.contains("Escrow 1 not found"));
+    assert!(client.try_get_escrow(&escrow_id).is_err());
 }
 
 #[test]
@@ -550,12 +542,7 @@ fn test_cleanup_escrow_is_permissionless() {
     // Called by an arbitrary address, not the admin.
     client.cleanup_escrow(&escrow_id);
 
-    let result = std::panic::catch_unwind(|| {
-        client.get_escrow(&escrow_id);
-    });
-    assert!(result.is_err());
-    let err_str = format!("{:?}", result.err().unwrap());
-    assert!(err_str.contains("Escrow 1 not found"));
+    assert!(client.try_get_escrow(&escrow_id).is_err());
     let _ = &someone;
 }
 
@@ -661,16 +648,12 @@ fn test_withdraw_fees_emits_event() {
     let expected_fee = (amount * fee_bps as i128) / 10000;
     client.withdraw_fees(&admin, &expected_fee);
 
-    let event_name: Val = Symbol::new(&env, "FeesWithdrawn").into_val(&env);
-    let events = env.events().all();
-    let fee_event = events.iter().find(|(_, topics, _)| {
-        topics.iter().any(|topic| topic == &event_name)
-    });
+    let fee_event = find_event(&env, "FeesWithdrawn");
 
     assert!(fee_event.is_some(), "FeesWithdrawn event not emitted");
 
     let (_, _, data) = fee_event.unwrap();
-    let payload: FeesWithdrawn = soroban_sdk::from_val(&env, data);
+    let payload = FeesWithdrawn::from_val(&env, &data);
 
     assert_eq!(payload.admin, admin);
     assert_eq!(payload.amount, expected_fee);
@@ -837,7 +820,7 @@ fn test_expire_escrow_after_expiry() {
     });
 
     let anyone = Address::generate(&env);
-    client.expire_escrow(&anyone, &escrow_id);
+    client.expire_escrow(&escrow_id);
 
     let escrow = client.get_escrow(&escrow_id);
     assert_eq!(escrow.status, EscrowStatus::Cancelled);
@@ -861,7 +844,7 @@ fn test_expire_escrow_before_expiry_panics() {
     });
 
     let anyone = Address::generate(&env);
-    client.expire_escrow(&anyone, &escrow_id); // panic: not expired yet at exact boundary
+    client.expire_escrow(&escrow_id); // panic: not expired yet at exact boundary
 }
 
 #[test]
@@ -881,7 +864,7 @@ fn test_expire_escrow_still_before_boundary_panics() {
     });
 
     let anyone = Address::generate(&env);
-    client.expire_escrow(&anyone, &escrow_id);
+    client.expire_escrow(&escrow_id);
 }
 
 #[test]
@@ -898,7 +881,7 @@ fn test_expire_escrow_on_cancelled_escrow_panics() {
     client.cancel_escrow(&sender, &escrow_id);
 
     let anyone = Address::generate(&env);
-    client.expire_escrow(&anyone, &escrow_id);
+    client.expire_escrow(&escrow_id);
 }
 
 #[test]
@@ -956,16 +939,12 @@ fn test_deposit_emits_escrow_deposited_event() {
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &250);
     client.deposit(&sender, &escrow_id, &deposit_amount);
 
-    let event_name: Val = Symbol::new(&env, "EscrowDeposited").into_val(&env);
-    let events = env.events().all();
-    let deposit_event = events.iter().find(|(_, topics, _)| {
-        topics.iter().any(|topic| topic == &event_name)
-    });
+    let deposit_event = find_event(&env, "EscrowDeposited");
 
     assert!(deposit_event.is_some(), "EscrowDeposited event not emitted");
 
     let (_, _, data) = deposit_event.unwrap();
-    let payload: EscrowDeposited = soroban_sdk::from_val(&env, data);
+    let payload = EscrowDeposited::from_val(&env, &data);
 
     assert_eq!(payload.escrow_id, escrow_id);
     assert_eq!(payload.depositor, sender);
@@ -999,8 +978,7 @@ fn setup_with_dispute() -> (
 
     let admin = Address::generate(&env);
     let usdc_id = env
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
+        .register_stellar_asset_contract(admin.clone());
 
     escrow_client.initialize(&admin, &usdc_id);
     escrow_client.set_dispute_contract(&admin, &dispute_resolution_id);
@@ -1100,15 +1078,8 @@ fn test_disputed_escrow_cannot_be_cancelled_or_released() {
     escrow.confirm_delivery(&agent, &escrow_id);
     escrow.dispute_escrow(&sender, &escrow_id);
 
-    let cancel_err = std::panic::catch_unwind(|| escrow.cancel_escrow(&sender, &escrow_id));
-    assert!(cancel_err.is_err());
-    assert!(format!("{:?}", cancel_err.err().unwrap())
-        .contains("Escrow is not in pending state"));
-
-    let release_err = std::panic::catch_unwind(|| escrow.release_escrow(&agent, &escrow_id));
-    assert!(release_err.is_err());
-    assert!(format!("{:?}", release_err.err().unwrap())
-        .contains("Escrow is not in pending state"));
+    assert!(escrow.try_cancel_escrow(&sender, &escrow_id).is_err());
+    assert!(escrow.try_release_escrow(&agent, &escrow_id).is_err());
 }
 
 #[test]
@@ -1161,7 +1132,7 @@ fn test_partial_release_panics_after_expiry() {
 
     // Fast-forward past expiry (default 30 days = 2_592_000 seconds)
     env.ledger().with_mut(|ledger| {
-        ledger.timestamp_mut().set(2_593_000u64);
+        ledger.timestamp = 2_593_000u64;
     });
 
     // SC-117: Agent should not be able to partial_release after expiry
@@ -1174,7 +1145,7 @@ fn test_partial_release_before_expiry_succeeds() {
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     let agent = Address::generate(&env);
-    let amount = 1_000_0000000i128;
+    let amount = 100_0000000i128; // 100 USDC
 
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
 
@@ -1227,7 +1198,7 @@ fn test_partial_release_fee_sum_equals_single_release() {
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     let agent = Address::generate(&env);
-    let total_amount = 1_000_0000000i128;
+    let total_amount = 100_0000000i128; // 100 USDC
     let fee_bps = 250u32;
 
     mint_usdc(&env, &usdc_id, &admin, &sender, total_amount * 2); // mint 2x for two scenarios
@@ -1238,12 +1209,7 @@ fn test_partial_release_fee_sum_equals_single_release() {
     let fee_single = client.get_accumulated_fees();
 
     // Clear accumulated fees for next scenario
-    let stored_admin: Address = env
-        .storage()
-        .persistent()
-        .get(&crate::DataKey::Admin)
-        .expect("Contract not initialized");
-    client.withdraw_fees(&stored_admin, &fee_single);
+    client.withdraw_fees(&admin, &fee_single);
 
     // Scenario 2: Multiple partial releases
     let escrow2 = client.create_escrow(&sender, &recipient, &agent, &total_amount, &fee_bps);

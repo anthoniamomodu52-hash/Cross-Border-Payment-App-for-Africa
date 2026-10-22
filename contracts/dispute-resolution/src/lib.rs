@@ -93,7 +93,7 @@ pub enum DataKey {
 // ── Domain types ──────────────────────────────────────────────────────────────
 
 /// Lifecycle state of a dispute.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[contracttype]
 pub enum DisputeStatus {
     /// Opened, awaiting evidence and arbitration.
@@ -385,9 +385,6 @@ impl DisputeResolutionContract {
         if amount <= 0 {
             panic!("amount must be positive");
         }
-        if env.caller() != escrow_contract {
-            panic!("unauthorized: caller is not the escrow contract");
-        }
         let trusted_escrow: Address = env
             .storage()
             .persistent()
@@ -396,6 +393,9 @@ impl DisputeResolutionContract {
         if escrow_contract != trusted_escrow {
             panic!("unauthorized: escrow contract not registered");
         }
+        // A contract address only passes require_auth when that contract is the
+        // direct invoker, so this proves the registered escrow is the caller.
+        escrow_contract.require_auth();
 
         let id: u64 = env
             .storage()
@@ -1186,9 +1186,9 @@ impl DisputeResolutionContract {
             .unwrap_or_else(|| Vec::new(&env));
         
         let total = user_disputes.len();
-        let actual_start = if start as usize > total { total } else { start as usize };
-        let actual_end = if actual_start + capped_limit as usize > total { total } else { actual_start + capped_limit as usize };
-        
+        let actual_start = if start > total { total } else { start };
+        let actual_end = actual_start.saturating_add(capped_limit).min(total);
+
         let mut result: Vec<u64> = Vec::new(&env);
         for i in actual_start..actual_end {
             if let Some(id) = user_disputes.get(i) {
