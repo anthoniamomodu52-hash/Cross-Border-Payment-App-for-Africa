@@ -19,12 +19,23 @@ async function notifyUser(userId, balanceId, expiresAt) {
   }
 }
 
-async function checkClaimableBalanceExpiry() {
+async function checkClaimableBalanceExpiry(now = new Date()) {
   const { rows: expired } = await db.query(
-    `UPDATE claimable_balances
-     SET status = 'expired', updated_at = NOW()
-     WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at <= NOW()
-     RETURNING id, balance_id, user_id, asset, amount`
+    `WITH expired_balances AS (
+       UPDATE claimable_balances
+       SET status = 'expired', updated_at = NOW()
+      WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at <= $1
+       RETURNING id, balance_id, user_id, asset, amount
+     ), expired_transactions AS (
+       UPDATE transactions AS tx
+      SET status = 'expired', confirmed_at = $1
+       FROM expired_balances AS balance
+       WHERE tx.claimable_balance_id = balance.balance_id
+         AND tx.status = 'pending_claim'
+       RETURNING tx.id
+     )
+    SELECT balance.* FROM expired_balances AS balance`,
+      [now],
   );
 
   for (const row of expired) {
@@ -45,13 +56,15 @@ async function checkClaimableBalanceExpiry() {
   }
 
   const { rows: expiringSoon } = await db.query(
-    `SELECT id, balance_id, user_id, asset, amount, expires_at
-     FROM claimable_balances
+    `UPDATE claimable_balances
+     SET warning_sent_at = $1, updated_at = $1
      WHERE status = 'active'
+       AND warning_sent_at IS NULL
        AND expires_at IS NOT NULL
-       AND expires_at > NOW()
-       AND expires_at <= NOW() + ($1 || ' hours')::interval`,
-    [WARN_HOURS]
+       AND expires_at > $1
+       AND expires_at <= $1 + ($2::int * interval '1 hour')
+     RETURNING id, balance_id, user_id, asset, amount, expires_at`,
+     [now, WARN_HOURS]
   );
 
   for (const row of expiringSoon) {
