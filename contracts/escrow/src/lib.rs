@@ -358,7 +358,6 @@ impl EscrowContract {
             .storage()
             .persistent()
             .get(&DataKey::Admin)
-            .unwrap();
             .expect("Contract not initialized");
 
         if admin != stored_admin {
@@ -379,7 +378,6 @@ impl EscrowContract {
             .storage()
             .persistent()
             .get(&DataKey::UsdcAddress)
-            .unwrap();
             .expect("Contract not initialized");
 
         token::Client::new(&env, &usdc_address).transfer(
@@ -394,7 +392,6 @@ impl EscrowContract {
     }
 
     pub fn get_metadata(env: Env) -> (Address, Address) {
-        let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
         let admin: Address = env
             .storage()
             .persistent()
@@ -404,7 +401,6 @@ impl EscrowContract {
             .storage()
             .persistent()
             .get(&DataKey::UsdcAddress)
-            .unwrap();
             .expect("Contract not initialized");
         (admin, usdc_address)
     }

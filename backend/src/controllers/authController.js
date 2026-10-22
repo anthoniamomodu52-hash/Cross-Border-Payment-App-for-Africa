@@ -303,7 +303,7 @@ async function login(req, res, next) {
     );
 
     // Record session for remote logout support
-    await recordSession(user.id, token, req).catch(() => {});
+    await recordSession(user.id, token, req, familyId).catch(() => {});
 
     res.cookie(COOKIE_NAME, raw, COOKIE_OPTIONS);
     audit.log(user.id, 'login_success', req.ip, req.headers['user-agent']);

@@ -13,17 +13,27 @@ function hashToken(token) {
  * Record a new session on login.
  * Called from authController.login after issuing the JWT.
  */
-async function recordSession(userId, token, req) {
+async function recordSession(userId, token, req, familyId = null) {
   const tokenHash = hashToken(token);
   const deviceInfo = req.headers['user-agent'] || null;
   const ipAddress = req.ip || req.connection?.remoteAddress || null;
 
   await db.query(
-    `INSERT INTO sessions (user_id, token_hash, device_info, ip_address)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO sessions (user_id, token_hash, device_info, ip_address, family_id)
+     VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (token_hash) DO UPDATE SET last_active = NOW()`,
-    [userId, tokenHash, deviceInfo, ipAddress]
+    [userId, tokenHash, deviceInfo, ipAddress, familyId]
   );
+}
+
+/**
+ * Revoke the refresh-token families linked to the given sessions so a revoked
+ * device cannot mint new access tokens via POST /auth/refresh.
+ */
+async function revokeFamilies(rows) {
+  const familyIds = rows.map((r) => r.family_id).filter(Boolean);
+  if (familyIds.length === 0) return;
+  await db.query(`DELETE FROM refresh_tokens WHERE family_id = ANY($1::uuid[])`, [familyIds]);
 }
 
 /**
@@ -108,14 +118,16 @@ async function listSessions(req, res, next) {
 async function revokeSession(req, res, next) {
   try {
     const { id } = req.params;
-    const { rowCount } = await db.query(
-      `DELETE FROM sessions WHERE id = $1 AND user_id = $2`,
+    const { rows, rowCount } = await db.query(
+      `DELETE FROM sessions WHERE id = $1 AND user_id = $2 RETURNING family_id`,
       [id, req.user.userId]
     );
 
     if (rowCount === 0) {
       return res.status(404).json({ error: 'Session not found' });
     }
+
+    await revokeFamilies(rows);
 
     logger.info('Session revoked', { sessionId: id, userId: req.user.userId });
     res.json({ message: 'Session revoked' });
@@ -136,12 +148,14 @@ async function revokeAllSessions(req, res, next) {
 
     if (keepCurrent && req.headers.authorization) {
       const currentHash = hashToken(req.headers.authorization.replace('Bearer ', ''));
-      await db.query(
-        `DELETE FROM sessions WHERE user_id = $1 AND token_hash != $2`,
+      const { rows } = await db.query(
+        `DELETE FROM sessions WHERE user_id = $1 AND token_hash != $2 RETURNING family_id`,
         [userId, currentHash]
       );
+      await revokeFamilies(rows);
     } else {
       await db.query(`DELETE FROM sessions WHERE user_id = $1`, [userId]);
+      await db.query(`DELETE FROM refresh_tokens WHERE user_id = $1`, [userId]);
     }
 
     logger.info('All sessions revoked', { userId, keepCurrent });
@@ -158,4 +172,5 @@ module.exports = {
   listSessions,
   revokeSession,
   revokeAllSessions,
+  revokeFamilies,
 };

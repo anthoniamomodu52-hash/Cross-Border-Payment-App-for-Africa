@@ -2,9 +2,12 @@
 
 # Soroban Contract Deployment Script
 # Supports: escrow, recurring-payments
-# Usage: [CONTRACT=recurring-payments] STELLAR_NETWORK=testnet SOROBAN_SECRET_KEY=<key> ./deploy.sh
+# Usage: [CONTRACT=recurring-payments] STELLAR_NETWORK=testnet SOROBAN_IDENTITY=<identity> ./deploy.sh
 
-set -e
+set -euo pipefail
+
+: "${SOROBAN_IDENTITY:=}" "${SOROBAN_SECRET_KEY:=}" "${EXPECTED_WASM_HASH:=}"
+: "${SOROBAN_RPC_HOST:=}" "${SOROBAN_NETWORK_PASSPHRASE:=}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -157,21 +160,51 @@ fi
 echo "RPC Host: $SOROBAN_RPC_HOST"
 echo "Network Passphrase: $SOROBAN_NETWORK_PASSPHRASE"
 
-# Check if a deploy key is provided
-if [ -z "$SOROBAN_SECRET_KEY" ]; then
-    echo -e "${YELLOW}Note: SOROBAN_SECRET_KEY not set. Please provide it to deploy.${NC}"
-    echo "Usage: export SOROBAN_SECRET_KEY='your-secret-key'; $0"
+# Resolve the signing identity. The secret key is never passed on the command
+# line (visible via ps / shell history); a named CLI identity is used instead.
+# See README "Deployer identity setup".
+if [ -z "$SOROBAN_IDENTITY" ]; then
+    if [ "$NETWORK" = "mainnet" ]; then
+        echo -e "${RED}Error: mainnet deploys require SOROBAN_IDENTITY (a named CLI identity, e.g. a Ledger key).${NC}"
+        exit 1
+    fi
+    if [ -z "$SOROBAN_SECRET_KEY" ]; then
+        echo -e "${YELLOW}Note: set SOROBAN_IDENTITY (or SOROBAN_SECRET_KEY on testnet) to deploy.${NC}"
+        exit 1
+    fi
+    SOROBAN_IDENTITY="afripay-testnet-deployer"
+    # Import the key via stdin so it never appears in argv
+    printf '%s\n' "$SOROBAN_SECRET_KEY" | $SOROBAN_CLI keys add "$SOROBAN_IDENTITY" --secret-key --overwrite >/dev/null
+fi
+unset SOROBAN_SECRET_KEY
+
+# Verify the WASM hash before deploying (mandatory on mainnet)
+WASM_HASH=$(sha256sum "$WASM_FILE" | awk '{print $1}')
+if [ -z "$WASM_HASH" ]; then
+    echo -e "${RED}Error: failed to compute WASM hash${NC}"
+    exit 1
+fi
+if [ -n "$EXPECTED_WASM_HASH" ] && [ "$WASM_HASH" != "$EXPECTED_WASM_HASH" ]; then
+    echo -e "${RED}Error: WASM hash mismatch (expected $EXPECTED_WASM_HASH, got $WASM_HASH)${NC}"
+    exit 1
+fi
+if [ "$NETWORK" = "mainnet" ] && [ -z "$EXPECTED_WASM_HASH" ]; then
+    echo -e "${RED}Error: mainnet deploys require EXPECTED_WASM_HASH to be set.${NC}"
     exit 1
 fi
 
-# Deploy using soroban CLI
-CONTRACT_ID=$($SOROBAN_CLI contract deploy \
+# Deploy: capture stdout only and fail on a non-zero exit status
+if ! DEPLOY_OUT=$($SOROBAN_CLI contract deploy \
     --wasm "$WASM_FILE" \
-    --source "$SOROBAN_SECRET_KEY" \
-    --network "$NETWORK" 2>&1 | tail -1 || true)
-
-if [ -z "$CONTRACT_ID" ]; then
+    --source "$SOROBAN_IDENTITY" \
+    --network "$NETWORK"); then
     echo -e "${RED}Error: Failed to deploy contract${NC}"
+    exit 1
+fi
+CONTRACT_ID=$(printf '%s\n' "$DEPLOY_OUT" | tail -1 | tr -d '[:space:]')
+
+if ! [[ "$CONTRACT_ID" =~ ^C[A-Z2-7]{55}$ ]]; then
+    echo -e "${RED}Error: deploy returned an invalid contract ID: '$CONTRACT_ID'${NC}"
     exit 1
 fi
 
@@ -191,7 +224,7 @@ cat > "$DEPLOYMENT_FILE" << EOF
   "deployed_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
   "rpc_host": "$SOROBAN_RPC_HOST",
   "network_passphrase": "$SOROBAN_NETWORK_PASSPHRASE",
-  "wasm_hash": "$(sha256sum "$WASM_FILE" | awk '{print $1}')"
+  "wasm_hash": "$WASM_HASH"
 }
 EOF
 
