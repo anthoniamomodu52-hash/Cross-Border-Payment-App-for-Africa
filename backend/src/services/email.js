@@ -236,6 +236,26 @@ async function sendKycExpiryReminderEmail(email, name, daysRemaining) {
   return enqueueEmail({ to: email, subject, html });
 }
 
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+async function sendEscrowCancelledEmail(email, name, amount, asset, txHash) {
+  const subject = 'AfriPay: Your payment has been cancelled and refunded';
+  const html = `
+    <p>Hi ${escapeHtml(name)},</p>
+    <p>Your payment of <strong>${escapeHtml(amount)} ${escapeHtml(asset)}</strong> has been cancelled and the funds have been refunded to your wallet.</p>
+    <p>Transaction Hash: <code>${escapeHtml(txHash)}</code></p>
+    <p><a href="${process.env.FRONTEND_URL}/history">View in AfriPay</a></p>
+  `;
+  return enqueueEmail({ to: email, subject, html });
+}
+
 module.exports = {
   initEmailQueue,
   drainEmailQueue,
@@ -249,4 +269,5 @@ module.exports = {
   sendBackupCodeWarningEmail,
   sendKycExpiryReminderEmail,
   sendEmailChangeRequestedNotice,
+  sendEscrowCancelledEmail,
 };

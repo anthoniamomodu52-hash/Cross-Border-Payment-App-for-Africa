@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, crypto::Hash, Address, Bytes, BytesN, Env, String, Symbol, Vec};
 
+#[cfg(test)]
 mod test;
 
 const DEFAULT_PROPOSAL_TTL_SECS: u64 = 604_800; // 7 days

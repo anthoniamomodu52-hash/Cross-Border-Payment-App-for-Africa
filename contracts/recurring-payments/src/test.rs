@@ -1019,3 +1019,71 @@ fn test_consecutive_misses_mix_with_successful_execution_and_counter_accuracy() 
     assert_eq!(client.get_remaining_executions(&id), Some(4));
 }
 
+// ── Due-date anchoring: late executions must not drift the schedule ──────────
+
+#[test]
+fn test_late_execution_within_grace_keeps_schedule_anchor() {
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    let interval = 30 * 86400u64;
+    let grace = 86400u64;
+    let id = client.create_recurring_payment(
+        &sender, &recipient, &token_id, &100_0000000, &interval, &0, &grace, &3,
+    );
+    let first_due = client.get_schedule(&id).next_payment_at;
+
+    // Execute 20 hours late — inside the 24 h grace window.
+    advance_time(&env, interval + 20 * 3600);
+    client.execute_payment(&executor, &id);
+
+    let s = client.get_schedule(&id);
+    assert_eq!(s.next_payment_at, first_due + interval);
+}
+
+#[test]
+fn test_repeated_late_executions_do_not_drift() {
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    let interval = 30 * 86400u64;
+    let grace = 86400u64;
+    let id = client.create_recurring_payment(
+        &sender, &recipient, &token_id, &10_0000000, &interval, &0, &grace, &3,
+    );
+    let first_due = client.get_schedule(&id).next_payment_at;
+
+    // Twelve cycles, each executed 20 hours after its due date.
+    for k in 0..12u64 {
+        let due = first_due + k * interval;
+        let now = env.ledger().timestamp();
+        advance_time(&env, due + 20 * 3600 - now);
+        client.execute_payment(&executor, &id);
+        assert_eq!(client.get_schedule(&id).next_payment_at, due + interval);
+    }
+
+    let s = client.get_schedule(&id);
+    assert_eq!(s.executions_completed, 12);
+    assert_eq!(s.next_payment_at, first_due + 12 * interval);
+    assert_eq!(token_balance(&env, &token_id, &recipient), 10_0000000 * 12);
+}
+
+#[test]
+fn test_very_late_execution_skips_to_next_grid_slot() {
+    // Grace (1 h) longer than the interval (10 min): a payment executed 25 min
+    // late must land on the next slot of the original grid after `now`, not
+    // allow a burst of back-to-back executions.
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
+    let client = RecurringPaymentsContractClient::new(&env, &contract_id);
+    let interval = 600u64;
+    let id = client.create_recurring_payment(
+        &sender, &recipient, &token_id, &10_0000000, &interval, &0, &3600, &3,
+    );
+    let first_due = client.get_schedule(&id).next_payment_at;
+
+    advance_time(&env, interval + 25 * 60);
+    client.execute_payment(&executor, &id);
+
+    let next = client.get_schedule(&id).next_payment_at;
+    assert_eq!(next, first_due + 3 * interval);
+    assert!(next > env.ledger().timestamp());
+    assert!(client.try_execute_payment(&executor, &id).is_err());
+}

@@ -15,22 +15,9 @@ const StellarSdk = require("@stellar/stellar-sdk");
 
 const { decryptAesCbc } = require("../utils/symmetricEncryption");
 
-const isTestnet = process.env.STELLAR_NETWORK !== "mainnet";
-const networkPassphrase = isTestnet
-  ? StellarSdk.Networks.TESTNET
-  : StellarSdk.Networks.PUBLIC;
-
-const rpcUrl =
-  process.env.SOROBAN_RPC_URL ||
-  (isTestnet
-    ? "https://soroban-testnet.stellar.org"
-    : "https://mainnet.soroban.stellar.org");
+const { networkPassphrase, getRpc, waitForSorobanTx } = require("../config/soroban");
 
 const CONTRACT_ID = process.env.LOYALTY_TOKEN_CONTRACT_ID;
-
-function getRpc() {
-  return new StellarSdk.SorobanRpc.Server(rpcUrl);
-}
 
 function decryptSecret(encryptedKey) {
   return decryptAesCbc(encryptedKey);
@@ -69,11 +56,7 @@ async function sendAndConfirm(keypair, method, args) {
     );
   }
 
-  let response = result;
-  while (response.status === "PENDING" || response.status === "NOT_FOUND") {
-    await new Promise((r) => setTimeout(r, 1000));
-    response = await rpc.getTransaction(result.hash);
-  }
+  const response = await waitForSorobanTx(rpc, result);
 
   if (response.status !== "SUCCESS") {
     throw Object.assign(

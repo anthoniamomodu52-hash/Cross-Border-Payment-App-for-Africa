@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol};
 
+#[cfg(test)]
 mod test;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -338,6 +339,80 @@ impl RecurringPaymentsContract {
     ///   a second call executes it.
     /// - When `consecutive_misses >= max_missed_executions` the schedule is
     ///   cancelled and `ScheduleAutoCancelled` is emitted.
+    // Pre-authorization semantics, replay/expiry rules, and schedule lifecycle:
+    //
+    // - Authorization vs schedule lifetime: pre-authorization is tied strictly
+    //   to the `RecurringSchedule` identified by `schedule_id`. Cancelling via
+    //   `cancel_recurring_payment` permanently revokes execution authority
+    //   ("schedule is not active"); pausing via `pause_recurring_payment` halts
+    //   execution ("Schedule is paused"). No separate authorization object
+    //   outlives a cancelled or paused schedule.
+    // - Replay protection: each execution checks `now >= next_payment_at` and
+    //   advances `next_payment_at` monotonically by `interval`.
+    // - Expiry: when `max_executions` is reached (if > 0), when
+    //   `max_missed_executions` consecutive windows are missed (auto-cancel),
+    //   or when the sender's off-chain token allowance expires or is revoked.
+
+    /// Deprecated alias for `create_recurring_payment`; use that instead.
+    ///
+    /// The schedule's asset is the token configured in `initialize` (USDC),
+    /// with no execution cap and default grace / missed-execution settings.
+    #[deprecated]
+    pub fn authorize_recurring(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        amount: i128,
+        interval: IntervalSecs,
+    ) -> u64 {
+        let token: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokenAddress)
+            .expect("not initialized");
+        Self::create_recurring_payment(
+            env,
+            sender,
+            recipient,
+            token,
+            amount,
+            interval,
+            0,
+            DEFAULT_GRACE_PERIOD_SECS,
+            DEFAULT_MAX_MISSED_EXECUTIONS,
+        )
+    }
+
+    /// Next due date after a successful execution at `now`, kept on the
+    /// original schedule grid (`next_payment_at + k * interval`).
+    ///
+    /// Normally this is just `next_payment_at + interval`. If the execution
+    /// was so late that this is already due (only possible when the grace
+    /// period is at least one interval), it skips ahead to the first grid
+    /// slot after `now`, so one call never unlocks a burst of back-to-back
+    /// payments.
+    fn next_anchored_due(schedule: &RecurringSchedule, now: u64) -> u64 {
+        let mut next = schedule.next_payment_at + schedule.interval;
+        if next <= now {
+            let behind = now - next;
+            next += (behind / schedule.interval + 1) * schedule.interval;
+        }
+        next
+    }
+
+    /// Execute a due payment for `schedule_id`.
+    /// Anyone may call this (permissionless / incentivized execution).
+    ///
+    /// Timing rules and Missed-execution Accounting:
+    /// - `now < next_payment_at`                          → panics "payment not yet due"
+    /// - `now` in `[next_payment_at, next_payment_at + grace_period_secs]`
+    ///                                                    → payment executed normally and resets `consecutive_misses` to 0
+    /// - `now > next_payment_at + grace_period_secs`      → miss recorded, `consecutive_misses` incremented by 1,
+    ///   `PaymentMissed` emitted, schedule state persisted, and function returns early.
+    ///
+    /// Auto-cancellation: once `consecutive_misses >= max_missed_executions` the schedule is
+    /// cancelled; below that, `next_payment_at` skips past elapsed intervals and the schedule
+    /// stays `Active`. A successful execution resets the miss counter to 0.
     pub fn execute_payment(env: Env, executor: Address, schedule_id: u64) {
         executor.require_auth();
 
@@ -467,7 +542,12 @@ impl RecurringPaymentsContract {
             .persistent()
             .set(&DataKey::MissedExecutions(schedule_id), &0u64);
 
-        schedule.next_payment_at = now + schedule.interval;
+        // Anchor the next due date to the schedule, not to when this call
+        // happened. Using `now + interval` made every late (in-grace)
+        // execution push the schedule later, so a "1st of the month" payment
+        // drifted by days over a year and disagreed with the off-chain
+        // calendar.
+        schedule.next_payment_at = Self::next_anchored_due(&schedule, now);
         schedule.executions_completed += 1;
 
         // A bounded schedule that has made all its payments is Completed,
