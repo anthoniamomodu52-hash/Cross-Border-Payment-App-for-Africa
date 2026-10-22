@@ -109,6 +109,9 @@ io.use(async (socket, next) => {
 });
 
 io.on('connection', async (socket) => {
+  // User-scoped room: user-level events (e.g. notification:new) are emitted
+  // here once, instead of once per wallet room (which duplicated them).
+  socket.join(`user:${socket.userId}`);
   try {
     const { rows } = await db.query(
       `SELECT w.public_key FROM wallets w WHERE w.user_id = $1`,

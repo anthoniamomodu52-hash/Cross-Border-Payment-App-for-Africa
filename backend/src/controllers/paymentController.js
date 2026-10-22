@@ -18,7 +18,7 @@ const {
 } = require("../services/stellar");
 const webhook = require("../services/webhook");
 const cache = require("../utils/cache");
-const { sendTransactionEmail, enqueueEmail } = require("../services/email");
+const { sendTransactionEmail, sendEscrowCancelledEmail } = require("../services/email");
 const { persistAndBroadcast } = require("../services/notificationInbox");
 const { checkVelocity, checkDailyLimit, checkFraud, logFraudBlock } = require("../services/fraudDetection");
 const { withLock } = require("../utils/distributedLock");
@@ -1327,14 +1327,7 @@ async function cancelPendingEscrow(req, res, next) {
       .then(({ rows }) => {
         if (!rows[0]) return;
         const { email, full_name } = rows[0];
-        enqueueEmail({
-          to: email,
-          subject: "AfriPay: Your payment has been cancelled and refunded",
-          html: `<p>Hi ${full_name},</p>
-<p>Your payment of <strong>${escrow.amount} ${escrow.asset}</strong> has been cancelled and the funds have been refunded to your wallet.</p>
-<p>Transaction Hash: <code>${cancelTxHash}</code></p>
-<p><a href="${process.env.FRONTEND_URL}/history">View in AfriPay</a></p>`,
-        }).catch(() => {});
+        sendEscrowCancelledEmail(email, full_name, escrow.amount, escrow.asset, cancelTxHash).catch(() => {});
       })
       .catch(() => {});
 
