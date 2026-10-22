@@ -39,6 +39,7 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, token, vec, Address, Env, Symbol, Vec,
 };
 
+#[cfg(test)]
 mod test;
 
 // ── Constants ─────────────────────────────────────────────────────────────────

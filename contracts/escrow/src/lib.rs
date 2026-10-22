@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, Symbol};
 
+#[cfg(test)]
 mod test;
 
 /// Semantic version of this contract. Bumped on every upgrade.
@@ -212,7 +213,8 @@ fn retention_period(env: &Env) -> u64 {
 }
 
 /// Helper function to check KYC verification via cross-contract call.
-/// Returns true if KYC is verified or if KYC checking is disabled (zero address).
+/// Returns true when no KYC contract is configured (KYC checking disabled);
+/// otherwise asks the configured kyc-attestation contract.
 fn is_kyc_verified(env: &Env, wallet: &Address) -> bool {
     let kyc_contract: Option<Address> = env
         .storage()
@@ -221,20 +223,11 @@ fn is_kyc_verified(env: &Env, wallet: &Address) -> bool {
 
     match kyc_contract {
         None => true, // KYC checking disabled
-        Some(addr) => {
-            // Check if address is zero (all bytes are 0)
-            let zero_addr = Address::from_contract_id(env, &[0u8; 32]);
-            if addr == zero_addr {
-                true // KYC checking disabled
-            } else {
-                // Cross-contract call to kyc-attestation contract
-                env.invoke_contract::<bool>(
-                    &addr,
-                    &Symbol::new(env, "is_verified"),
-                    soroban_sdk::vec![env, wallet.clone().into_val(env)],
-                )
-            }
-        }
+        Some(addr) => env.invoke_contract::<bool>(
+            &addr,
+            &Symbol::new(env, "is_verified"),
+            soroban_sdk::vec![env, wallet.clone().into_val(env)],
+        ),
     }
 }
 
@@ -1150,13 +1143,22 @@ impl EscrowContract {
         first_id
     }
 
-    /// Set the KYC contract address. Only admin may call this.
-    /// Pass a zero address (all bytes 0) to disable KYC checking.
+    /// Set the KYC contract address, enabling KYC checks on escrow creation.
+    /// Only admin may call this. Use `clear_kyc_contract` to disable checks.
     pub fn set_kyc_contract(env: Env, admin: Address, kyc_contract: Address) {
         require_admin(&env, &admin);
         env.storage()
             .persistent()
             .set(&DataKey::KycContractAddress, &kyc_contract);
+    }
+
+    /// Remove the KYC contract address, disabling KYC checks.
+    /// Only admin may call this.
+    pub fn clear_kyc_contract(env: Env, admin: Address) {
+        require_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::KycContractAddress);
     }
 
     /// Set the dispute-resolution contract address. Only admin may call this.
