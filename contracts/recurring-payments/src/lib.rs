@@ -34,12 +34,15 @@ pub enum DataKey {
 /// Frequency of a recurring payment, expressed in seconds.
 pub type IntervalSecs = u64;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[contracttype]
 pub enum ScheduleStatus {
     Active,
+    /// Stopped by the sender, or auto-cancelled after too many missed windows.
     Cancelled,
     Paused,
+    /// Finished successfully: all `max_executions` payments were made.
+    Completed,
 }
 
 #[derive(Clone)]
@@ -134,17 +137,39 @@ pub struct RecipientUpdated {
     pub updated_by: Address,
 }
 
-/// Emitted when an execution window (plus grace period) passes without a
-/// successful payment. Also emitted when the caller detects a missed window
-/// by calling `execute_payment` after the grace period has expired.
+/// Emitted when `execute_payment` finds one or more execution windows whose
+/// grace period expired without a successful payment.
 #[derive(Clone)]
 #[contracttype]
 pub struct PaymentMissed {
     pub schedule_id: u64,
     /// Ledger timestamp at which the miss was recorded.
     pub missed_at: u64,
+    /// Number of windows found missed by this call (can be > 1 when nobody
+    /// executed the schedule for several intervals).
+    pub newly_missed: u64,
     /// Total consecutive misses recorded for this schedule after this event.
     pub total_missed: u64,
+}
+
+/// Emitted when a bounded schedule makes its final payment and becomes
+/// `Completed`.
+#[derive(Clone)]
+#[contracttype]
+pub struct ScheduleCompleted {
+    pub schedule_id: u64,
+    pub executions_completed: u64,
+    pub completed_at: u64,
+}
+
+/// Emitted when a schedule is cancelled automatically because it reached
+/// `max_missed_executions` consecutive missed windows.
+#[derive(Clone)]
+#[contracttype]
+pub struct ScheduleAutoCancelled {
+    pub schedule_id: u64,
+    pub total_missed: u64,
+    pub cancelled_at: u64,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -191,6 +216,11 @@ impl RecurringPaymentsContract {
     ///                             late execution is still accepted (default 3 600).
     /// * `max_missed_executions` — Consecutive misses before auto-cancel (default 3,
     ///                             0 means use contract default).
+    ///
+    /// Authorization lives only as long as the schedule: cancelling it
+    /// revokes execution, pausing halts it, and it ends after
+    /// `max_executions` payments (if > 0), after `max_missed_executions`
+    /// consecutive misses, or when the sender's token allowance lapses.
     ///
     /// Returns the new schedule ID.
     pub fn create_recurring_payment(
@@ -297,6 +327,18 @@ impl RecurringPaymentsContract {
         id
     }
 
+    /// Execute a due payment for `schedule_id`. Anyone may call this.
+    ///
+    /// - `now < next_payment_at` → panics "payment not yet due".
+    /// - `now <= next_payment_at + grace_period_secs` → payment executes and
+    ///   `consecutive_misses` resets to 0.
+    /// - Otherwise every window whose grace period has expired counts as a
+    ///   miss (one per interval, not one per call). `next_payment_at` moves to
+    ///   the first window that has not expired, `PaymentMissed` is emitted and
+    ///   the call returns without paying. If the open window is already due,
+    ///   a second call executes it.
+    /// - When `consecutive_misses >= max_missed_executions` the schedule is
+    ///   cancelled and `ScheduleAutoCancelled` is emitted.
     // Pre-authorization semantics, replay/expiry rules, and schedule lifecycle:
     //
     // - Authorization vs schedule lifetime: pre-authorization is tied strictly
@@ -396,19 +438,22 @@ impl RecurringPaymentsContract {
         // ── Grace period check ────────────────────────────────────────────────
         let grace_deadline = schedule.next_payment_at + schedule.grace_period_secs;
         if now > grace_deadline {
-            // The execution window AND grace period have both passed.
-            // Record the miss, emit the event, and potentially auto-cancel.
-            schedule.consecutive_misses += 1;
-            let total_missed = schedule.consecutive_misses;
+            // Count every window whose grace period has expired: window k is
+            // due at next_payment_at + k * interval and expired if its
+            // deadline (due + grace) is before `now`. Window 0 is known to
+            // have expired, so newly_missed >= 1.
+            let newly_missed = (now - grace_deadline - 1) / schedule.interval + 1;
+            let total_missed = schedule.consecutive_misses.saturating_add(newly_missed);
+            schedule.consecutive_misses = total_missed;
 
-            // Advance next_payment_at so the schedule does not get permanently stuck.
-            // Skip forward by enough intervals to land in the future.
-            let elapsed = now - schedule.next_payment_at;
-            let intervals_missed = elapsed / schedule.interval + 1;
-            schedule.next_payment_at += intervals_missed * schedule.interval;
+            // Move to the first window that has not expired yet.
+            schedule.next_payment_at = newly_missed
+                .checked_mul(schedule.interval)
+                .and_then(|skip| schedule.next_payment_at.checked_add(skip))
+                .expect("next_payment_at overflow");
 
-            // Auto-cancel if the consecutive miss threshold is reached.
-            if total_missed >= schedule.max_missed_executions {
+            let auto_cancelled = total_missed >= schedule.max_missed_executions;
+            if auto_cancelled {
                 schedule.status = ScheduleStatus::Cancelled;
             }
 
@@ -425,9 +470,21 @@ impl RecurringPaymentsContract {
                 PaymentMissed {
                     schedule_id,
                     missed_at: now,
+                    newly_missed,
                     total_missed,
                 },
             );
+
+            if auto_cancelled {
+                env.events().publish(
+                    (Symbol::new(&env, "ScheduleAutoCancelled"),),
+                    ScheduleAutoCancelled {
+                        schedule_id,
+                        total_missed,
+                        cancelled_at: now,
+                    },
+                );
+            }
 
             return;
         }
@@ -493,9 +550,12 @@ impl RecurringPaymentsContract {
         schedule.next_payment_at = Self::next_anchored_due(&schedule, now);
         schedule.executions_completed += 1;
 
-        // Cancel schedule if max executions reached
-        if schedule.max_executions > 0 && schedule.executions_completed >= schedule.max_executions {
-            schedule.status = ScheduleStatus::Cancelled;
+        // A bounded schedule that has made all its payments is Completed,
+        // not Cancelled, so clients can tell success from cancellation.
+        let completed = schedule.max_executions > 0
+            && schedule.executions_completed >= schedule.max_executions;
+        if completed {
+            schedule.status = ScheduleStatus::Completed;
         }
 
         env.storage()
@@ -512,6 +572,17 @@ impl RecurringPaymentsContract {
                 executions_completed: schedule.executions_completed,
             },
         );
+
+        if completed {
+            env.events().publish(
+                (Symbol::new(&env, "ScheduleCompleted"),),
+                ScheduleCompleted {
+                    schedule_id,
+                    executions_completed: schedule.executions_completed,
+                    completed_at: now,
+                },
+            );
+        }
     }
 
     /// Cancel a recurring schedule. Only the original sender may cancel.
@@ -530,6 +601,9 @@ impl RecurringPaymentsContract {
         }
         if schedule.status == ScheduleStatus::Cancelled {
             panic!("schedule is already cancelled");
+        }
+        if schedule.status == ScheduleStatus::Completed {
+            panic!("schedule is already completed");
         }
 
         schedule.status = ScheduleStatus::Cancelled;
@@ -618,24 +692,12 @@ impl RecurringPaymentsContract {
         );
     }
 
-    /// Deprecated alias for cancel_recurring_payment. Use cancel_recurring_payment instead.
-    #[deprecated]
-    pub fn cancel_recurring(env: Env, sender: Address, schedule_id: u64) {
-        Self::cancel_recurring_payment(env, sender, schedule_id)
-    }
-
     /// Read a schedule by ID.
     pub fn get_schedule(env: Env, schedule_id: u64) -> RecurringSchedule {
         env.storage()
             .persistent()
             .get(&DataKey::Schedule(schedule_id))
             .expect("schedule not found")
-    }
-
-    /// Deprecated alias for get_schedule. Use get_schedule instead.
-    #[deprecated]
-    pub fn get_recurring_payment(env: Env, schedule_id: u64) -> RecurringSchedule {
-        Self::get_schedule(env, schedule_id)
     }
 
     /// Update the payment amount for a recurring schedule. Only the sender may update.
@@ -658,6 +720,9 @@ impl RecurringPaymentsContract {
         }
         if schedule.status == ScheduleStatus::Cancelled {
             panic!("cannot update cancelled schedule");
+        }
+        if schedule.status == ScheduleStatus::Completed {
+            panic!("cannot update completed schedule");
         }
 
         let old_amount = schedule.amount;
@@ -702,6 +767,9 @@ impl RecurringPaymentsContract {
         }
         if schedule.status == ScheduleStatus::Cancelled {
             panic!("cannot update cancelled schedule");
+        }
+        if schedule.status == ScheduleStatus::Completed {
+            panic!("cannot update completed schedule");
         }
 
         let old_recipient = schedule.recipient.clone();
@@ -770,14 +838,6 @@ impl RecurringPaymentsContract {
             i = i.saturating_add(1);
         }
         result
-    }
-
-    /// Returns the full schedule struct for a given ID.
-    pub fn get_schedule_by_id(env: Env, schedule_id: u64) -> RecurringSchedule {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Schedule(schedule_id))
-            .expect("schedule not found")
     }
 
     /// Returns paginated IDs of schedules with Active status.

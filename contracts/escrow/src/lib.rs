@@ -692,6 +692,10 @@ impl EscrowContract {
     /// marked `UnderDispute` and can no longer be released, cancelled, deposited
     /// into, or expired. The adjudicated winner is paid by the dispute contract.
     ///
+    /// The `caller` pays the dispute contract's filing fee from their own
+    /// balance (not from the escrowed funds). It is refunded if they win and
+    /// forfeited if they lose, which deters frivolous disputes.
+    ///
     /// # Arguments
     /// * `caller`   — The escrow recipient, or the sender before delivery is
     ///                confirmed (auth required).
@@ -752,6 +756,7 @@ impl EscrowContract {
             soroban_sdk::vec![
                 &env,
                 env.current_contract_address().into_val(&env),
+                caller.clone().into_val(&env),
                 escrow_id.into_val(&env),
                 escrow.sender.clone().into_val(&env),
                 escrow.recipient.clone().into_val(&env),

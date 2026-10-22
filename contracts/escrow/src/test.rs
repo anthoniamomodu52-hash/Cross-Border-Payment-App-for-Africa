@@ -1033,6 +1033,9 @@ fn test_deposit_emits_escrow_deposited_event() {
 
 // ── escrow → dispute-resolution cross-contract hook ───────────────────────────
 
+/// Default dispute filing fee charged by the dispute-resolution contract.
+const DISPUTE_FILING_FEE: i128 = 50_000000;
+
 /// Register both the escrow and dispute-resolution contracts in the same Env,
 /// wire them together (escrow → dispute hook + dispute → trusted escrow), and
 /// return the handles needed by the integration tests.
@@ -1094,6 +1097,12 @@ fn test_dispute_escrow_hands_funds_to_dispute_resolution() {
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
 
     let escrow_id = escrow.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    // Agent confirms delivery, which blocks the sender from cancelling.
+    escrow.confirm_delivery(&agent, &escrow_id);
+
+    // Sender's recourse: escalate the confirmed-but-unreleased escrow.
+    // The sender must also cover the dispute filing fee.
+    mint_usdc(&env, &usdc_id, &admin, &sender, DISPUTE_FILING_FEE);
     // Before delivery is confirmed, the sender may escalate.
     let dispute_id = escrow.dispute_escrow(&sender, &escrow_id);
 
@@ -1102,12 +1111,14 @@ fn test_dispute_escrow_hands_funds_to_dispute_resolution() {
         EscrowStatus::UnderDispute
     );
 
-    // Full balance leaves escrow custody and now sits with the arbiter.
+    // Full balance leaves escrow custody and now sits with the arbiter,
+    // together with the opener's filing fee.
     assert_eq!(TokenClient::new(&env, &usdc_id).balance(&escrow_contract_id), 0);
     assert_eq!(
         TokenClient::new(&env, &usdc_id).balance(&dispute_resolution_id),
-        amount
+        amount + DISPUTE_FILING_FEE
     );
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), 0);
 
     let d = dispute.get_dispute(&dispute_id);
     assert_eq!(d.sender, sender);
@@ -1135,6 +1146,7 @@ fn test_dispute_escrow_by_recipient() {
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
 
     let escrow_id = escrow.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    mint_usdc(&env, &usdc_id, &admin, &recipient, DISPUTE_FILING_FEE);
     escrow.dispute_escrow(&recipient, &escrow_id);
 
     assert_eq!(
@@ -1144,8 +1156,10 @@ fn test_dispute_escrow_by_recipient() {
     assert_eq!(TokenClient::new(&env, &usdc_id).balance(&escrow_contract_id), 0);
     assert_eq!(
         TokenClient::new(&env, &usdc_id).balance(&dispute_resolution_id),
-        amount
+        amount + DISPUTE_FILING_FEE
     );
+    // The recipient (opener) paid the fee, not the sender.
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&recipient), 0);
 }
 
 #[test]
@@ -1160,6 +1174,8 @@ fn test_disputed_escrow_cannot_be_cancelled_or_released() {
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
 
     let escrow_id = escrow.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    escrow.confirm_delivery(&agent, &escrow_id);
+    mint_usdc(&env, &usdc_id, &admin, &sender, DISPUTE_FILING_FEE);
     escrow.dispute_escrow(&sender, &escrow_id);
 
     assert!(escrow.try_cancel_escrow(&sender, &escrow_id).is_err());
@@ -1181,6 +1197,87 @@ fn test_dispute_escrow_third_party_panics() {
 
     let escrow_id = escrow.create_escrow(&sender, &recipient, &agent, &amount, &250);
     escrow.dispute_escrow(&outsider, &escrow_id);
+}
+
+#[test]
+#[should_panic(expected = "Insufficient balance for dispute filing fee")]
+fn test_dispute_escrow_without_filing_fee_panics() {
+    let (env, escrow, _, _, admin, usdc_id) = setup_with_dispute();
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let amount = 1_000_0000000i128;
+
+    mint_usdc(&env, &usdc_id, &admin, &sender, amount);
+
+    let escrow_id = escrow.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    // Recipient holds no USDC, so cannot pay the filing fee.
+    escrow.dispute_escrow(&recipient, &escrow_id);
+}
+
+#[test]
+fn test_dispute_escrow_filing_fee_refunded_when_opener_wins() {
+    use dispute_resolution_contract::DisputeResolutionContractClient;
+
+    let (env, escrow, _, dispute_resolution_id, admin, usdc_id) = setup_with_dispute();
+    let dispute = DisputeResolutionContractClient::new(&env, &dispute_resolution_id);
+    let arbitrator = Address::generate(&env);
+    dispute.propose_new_arbitrator(&admin, &arbitrator);
+    dispute.accept_arbitrator(&arbitrator);
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let amount = 1_000_0000000i128;
+
+    mint_usdc(&env, &usdc_id, &admin, &sender, amount + DISPUTE_FILING_FEE);
+    let escrow_id = escrow.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    let dispute_id = escrow.dispute_escrow(&sender, &escrow_id);
+
+    dispute.resolve_dispute(&arbitrator, &dispute_id, &false);
+    env.ledger().with_mut(|li| li.timestamp += 24 * 60 * 60 + 1);
+    dispute.finalize_resolution(&dispute_id);
+
+    // Sender won: escrowed amount and filing fee both returned.
+    assert_eq!(
+        TokenClient::new(&env, &usdc_id).balance(&sender),
+        amount + DISPUTE_FILING_FEE
+    );
+}
+
+#[test]
+fn test_dispute_escrow_filing_fee_forfeited_when_opener_loses() {
+    use dispute_resolution_contract::DisputeResolutionContractClient;
+
+    let (env, escrow, _, dispute_resolution_id, admin, usdc_id) = setup_with_dispute();
+    let dispute = DisputeResolutionContractClient::new(&env, &dispute_resolution_id);
+    let arbitrator = Address::generate(&env);
+    let fee_distributor = Address::generate(&env);
+    dispute.propose_new_arbitrator(&admin, &arbitrator);
+    dispute.accept_arbitrator(&arbitrator);
+    dispute.set_fee_distributor_address(&admin, &fee_distributor);
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let amount = 1_000_0000000i128;
+
+    mint_usdc(&env, &usdc_id, &admin, &sender, amount + DISPUTE_FILING_FEE);
+    let escrow_id = escrow.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    let dispute_id = escrow.dispute_escrow(&sender, &escrow_id);
+
+    dispute.resolve_dispute(&arbitrator, &dispute_id, &true);
+    env.ledger().with_mut(|li| li.timestamp += 24 * 60 * 60 + 1);
+    dispute.finalize_resolution(&dispute_id);
+
+    // Sender lost a frivolous dispute: the fee goes to the fee distributor.
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), 0);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&recipient), amount);
+    assert_eq!(
+        TokenClient::new(&env, &usdc_id).balance(&fee_distributor),
+        DISPUTE_FILING_FEE
+    );
 }
 
 #[test]
