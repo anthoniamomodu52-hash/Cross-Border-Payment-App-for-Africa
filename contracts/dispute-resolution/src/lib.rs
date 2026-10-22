@@ -94,7 +94,7 @@ pub enum DataKey {
 // ── Domain types ──────────────────────────────────────────────────────────────
 
 /// Lifecycle state of a dispute.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[contracttype]
 pub enum DisputeStatus {
     /// Opened, awaiting evidence and arbitration.
@@ -371,8 +371,10 @@ impl DisputeResolutionContract {
     /// contract may call this function.
     ///
     /// # Arguments
-    /// * `escrow_contract` — The calling escrow contract. Must be the immediate
-    ///                       caller and match the registered escrow contract.
+    /// * `escrow_contract` — The calling escrow contract. Must match the
+    ///                       registered escrow contract and authorise the call
+    ///                       (`require_auth`), which it does implicitly when it
+    ///                       is the direct invoker.
     /// * `sender`          — Original escrow sender.
     /// * `recipient`       — Intended escrow recipient.
     /// * `amount`          — USDC amount (in stroops) already transferred.
@@ -386,9 +388,6 @@ impl DisputeResolutionContract {
         if amount <= 0 {
             panic!("amount must be positive");
         }
-        if env.caller() != escrow_contract {
-            panic!("unauthorized: caller is not the escrow contract");
-        }
         let trusted_escrow: Address = env
             .storage()
             .persistent()
@@ -397,6 +396,10 @@ impl DisputeResolutionContract {
         if escrow_contract != trusted_escrow {
             panic!("unauthorized: escrow contract not registered");
         }
+        // Soroban has no implicit "msg.sender". When the escrow contract
+        // invokes this function directly, its own address is authorised
+        // automatically; any other invoker cannot produce this auth.
+        escrow_contract.require_auth();
 
         let id: u64 = env
             .storage()
@@ -1186,10 +1189,10 @@ impl DisputeResolutionContract {
             .get(&DataKey::UserDisputes(user))
             .unwrap_or_else(|| Vec::new(&env));
         
-        let total = user_disputes.len();
-        let actual_start = if start as usize > total { total } else { start as usize };
-        let actual_end = if actual_start + capped_limit as usize > total { total } else { actual_start + capped_limit as usize };
-        
+        let total: u32 = user_disputes.len();
+        let actual_start = start.min(total);
+        let actual_end = actual_start.saturating_add(capped_limit).min(total);
+
         let mut result: Vec<u64> = Vec::new(&env);
         for i in actual_start..actual_end {
             if let Some(id) = user_disputes.get(i) {
@@ -1205,9 +1208,9 @@ impl DisputeResolutionContract {
         let capped_limit = if limit > 50 { 50 } else { limit };
         let total_disputes: u64 = env.storage().persistent().get(&DataKey::TotalDisputes).unwrap_or(0);
         
-        let actual_start = if start as u64 > total_disputes { total_disputes } else { start as u64 };
-        let actual_end = if actual_start + capped_limit as u64 > total_disputes { total_disputes } else { actual_start + capped_limit as u64 };
-        
+        let actual_start = (start as u64).min(total_disputes);
+        let actual_end = actual_start.saturating_add(capped_limit as u64).min(total_disputes);
+
         let mut result: Vec<u64> = Vec::new(&env);
         for i in actual_start..actual_end {
             result.push_back(i + 1); // Dispute IDs are 1-indexed
