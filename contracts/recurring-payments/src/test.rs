@@ -60,6 +60,18 @@ fn token_balance(env: &Env, token_id: &Address, account: &Address) -> i128 {
     TokenClient::new(env, token_id).balance(account)
 }
 
+/// Create a schedule with no execution cap and default grace / miss limits.
+fn create(
+    client: &RecurringPaymentsContractClient,
+    token_id: &Address,
+    sender: &Address,
+    recipient: &Address,
+    amount: i128,
+    interval: u64,
+) -> u64 {
+    client.create_recurring_payment(sender, recipient, token_id, &amount, &interval, &0, &0, &0)
+}
+
 fn set_time(env: &Env, timestamp: u64) {
     let info = env.ledger().get();
     env.ledger().set(LedgerInfo { timestamp, ..info });
@@ -118,21 +130,21 @@ fn test_initialize_fee_bps_too_high_panics() {
     RecurringPaymentsContractClient::new(&env, &contract_id).initialize(&admin, &token_id, &10_001);
 }
 
-// ── authorize_recurring ───────────────────────────────────────────────────────
+// ── create_recurring_payment ──────────────────────────────────────────────────
 
 #[test]
-fn test_authorize_recurring_returns_id_one() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
+fn test_create_recurring_returns_id_one() {
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &1_000_0000000, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, 1_000_0000000, 86400);
     assert_eq!(id, 1);
 }
 
 #[test]
-fn test_authorize_recurring_stores_schedule() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
+fn test_create_recurring_stores_schedule() {
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &500_0000000, &3600);
+    let id = create(&client, &token_id, &sender, &recipient, 500_0000000, 3600);
     let s = client.get_schedule(&id);
     assert_eq!(s.sender, sender);
     assert_eq!(s.recipient, recipient);
@@ -142,37 +154,37 @@ fn test_authorize_recurring_stores_schedule() {
 }
 
 #[test]
-fn test_authorize_recurring_ids_increment() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
+fn test_create_recurring_ids_increment() {
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id1 = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
-    let id2 = client.authorize_recurring(&sender, &recipient, &200_0000000, &86400);
+    let id1 = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
+    let id2 = create(&client, &token_id, &sender, &recipient, 200_0000000, 86400);
     assert_eq!(id1, 1);
     assert_eq!(id2, 2);
 }
 
 #[test]
 #[should_panic(expected = "amount must be positive")]
-fn test_authorize_zero_amount_panics() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
+fn test_create_zero_amount_panics() {
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    client.authorize_recurring(&sender, &recipient, &0, &86400);
+    create(&client, &token_id, &sender, &recipient, 0, 86400);
 }
 
 #[test]
 #[should_panic(expected = "amount must be positive")]
-fn test_authorize_negative_amount_panics() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
+fn test_create_negative_amount_panics() {
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    client.authorize_recurring(&sender, &recipient, &-1, &86400);
+    create(&client, &token_id, &sender, &recipient, -1, 86400);
 }
 
 #[test]
 #[should_panic(expected = "interval must be > 0")]
-fn test_authorize_zero_interval_panics() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
+fn test_create_zero_interval_panics() {
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    client.authorize_recurring(&sender, &recipient, &100_0000000, &0);
+    create(&client, &token_id, &sender, &recipient, 100_0000000, 0);
 }
 
 // ── execute_payment ───────────────────────────────────────────────────────────
@@ -182,7 +194,7 @@ fn test_execute_payment_transfers_funds() {
     let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
     let amount = 1_000_0000000i128;
-    let id = client.authorize_recurring(&sender, &recipient, &amount, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, amount, 86400);
 
     advance_time(&env, 86400);
 
@@ -194,9 +206,9 @@ fn test_execute_payment_transfers_funds() {
 
 #[test]
 fn test_execute_payment_advances_next_payment_at() {
-    let (env, contract_id, _, sender, recipient, executor, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
 
     advance_time(&env, 86400);
     let ts_before_exec = env.ledger().timestamp();
@@ -211,7 +223,7 @@ fn test_execute_payment_multiple_cycles() {
     let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
     let amount = 500_0000000i128;
-    let id = client.authorize_recurring(&sender, &recipient, &amount, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, amount, 86400);
 
     for _ in 0..3 {
         advance_time(&env, 86400);
@@ -224,9 +236,9 @@ fn test_execute_payment_multiple_cycles() {
 #[test]
 #[should_panic(expected = "payment not yet due")]
 fn test_execute_payment_too_early_panics() {
-    let (env, contract_id, _, sender, recipient, executor, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
     // Do NOT advance time
     client.execute_payment(&executor, &id);
 }
@@ -242,10 +254,10 @@ fn test_execute_payment_unknown_id_panics() {
 #[test]
 #[should_panic(expected = "schedule is not active")]
 fn test_execute_payment_on_cancelled_schedule_panics() {
-    let (env, contract_id, _, sender, recipient, executor, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
-    client.cancel_recurring(&sender, &id);
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
+    client.cancel_recurring_payment(&sender, &id);
 
     advance_time(&env, 86400);
     client.execute_payment(&executor, &id);
@@ -255,10 +267,10 @@ fn test_execute_payment_on_cancelled_schedule_panics() {
 
 #[test]
 fn test_cancel_sets_status_cancelled() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
-    client.cancel_recurring(&sender, &id);
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
+    client.cancel_recurring_payment(&sender, &id);
     let s = client.get_schedule(&id);
     assert_eq!(s.status, ScheduleStatus::Cancelled);
 }
@@ -266,20 +278,20 @@ fn test_cancel_sets_status_cancelled() {
 #[test]
 #[should_panic(expected = "only the sender can cancel")]
 fn test_cancel_by_non_sender_panics() {
-    let (env, contract_id, _, sender, recipient, executor, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
-    client.cancel_recurring(&executor, &id); // executor is not the sender
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
+    client.cancel_recurring_payment(&executor, &id); // executor is not the sender
 }
 
 #[test]
 #[should_panic(expected = "schedule is already cancelled")]
 fn test_cancel_already_cancelled_panics() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
-    client.cancel_recurring(&sender, &id);
-    client.cancel_recurring(&sender, &id); // second cancel must panic
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
+    client.cancel_recurring_payment(&sender, &id);
+    client.cancel_recurring_payment(&sender, &id); // second cancel must panic
 }
 
 #[test]
@@ -287,7 +299,7 @@ fn test_cancel_already_cancelled_panics() {
 fn test_cancel_unknown_id_panics() {
     let (env, contract_id, _, sender, ..) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    client.cancel_recurring(&sender, &999);
+    client.cancel_recurring_payment(&sender, &999);
 }
 
 // ── get_schedule ──────────────────────────────────────────────────────────────
@@ -304,24 +316,24 @@ fn test_get_schedule_unknown_id_panics() {
 
 #[test]
 fn test_pause_sets_status_paused() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
     client.pause_recurring_payment(&sender, &id);
-    let s = client.get_recurring_payment(&id);
+    let s = client.get_schedule(&id);
     assert_eq!(s.status, ScheduleStatus::Paused);
 }
 
 #[test]
 fn test_resume_sets_status_active_and_updates_next_payment_at() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
     let before = env.ledger().timestamp();
     client.pause_recurring_payment(&sender, &id);
     advance_time(&env, 86400);
     client.resume_recurring_payment(&sender, &id);
-    let s = client.get_recurring_payment(&id);
+    let s = client.get_schedule(&id);
     assert_eq!(s.status, ScheduleStatus::Active);
     assert_eq!(s.next_payment_at, before + 86400 + 86400);
 }
@@ -329,9 +341,9 @@ fn test_resume_sets_status_active_and_updates_next_payment_at() {
 #[test]
 #[should_panic(expected = "Schedule is paused")]
 fn test_execute_payment_while_paused_panics() {
-    let (env, contract_id, _, sender, recipient, executor, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
     client.pause_recurring_payment(&sender, &id);
     advance_time(&env, 86400);
     client.execute_payment(&executor, &id);
@@ -342,7 +354,7 @@ fn test_resume_allows_execution() {
     let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
     let amount = 100_0000000i128;
-    let id = client.authorize_recurring(&sender, &recipient, &amount, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, amount, 86400);
     client.pause_recurring_payment(&sender, &id);
     advance_time(&env, 86400);
     client.resume_recurring_payment(&sender, &id);
@@ -353,9 +365,9 @@ fn test_resume_allows_execution() {
 #[test]
 #[should_panic(expected = "schedule is already paused")]
 fn test_pause_already_paused_panics() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
     client.pause_recurring_payment(&sender, &id);
     client.pause_recurring_payment(&sender, &id);
 }
@@ -363,9 +375,9 @@ fn test_pause_already_paused_panics() {
 #[test]
 #[should_panic(expected = "schedule is cancelled")]
 fn test_resume_cancelled_schedule_panics() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
     client.cancel_recurring_payment(&sender, &id);
     client.resume_recurring_payment(&sender, &id);
 }
@@ -373,18 +385,18 @@ fn test_resume_cancelled_schedule_panics() {
 #[test]
 #[should_panic(expected = "only the sender can pause")]
 fn test_pause_by_non_sender_panics() {
-    let (env, contract_id, _, sender, recipient, executor, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
     client.pause_recurring_payment(&executor, &id);
 }
 
 #[test]
 #[should_panic(expected = "only the sender can resume")]
 fn test_resume_by_non_sender_panics() {
-    let (env, contract_id, _, sender, recipient, executor, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
     client.pause_recurring_payment(&sender, &id);
     client.resume_recurring_payment(&executor, &id);
 }
@@ -392,20 +404,20 @@ fn test_resume_by_non_sender_panics() {
 #[test]
 #[should_panic(expected = "schedule is not paused")]
 fn test_resume_active_schedule_panics() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
     client.resume_recurring_payment(&sender, &id);
 }
 
 #[test]
 fn test_cancel_paused_schedule() {
-    let (env, contract_id, _, sender, recipient, _, _) = setup();
+    let (env, contract_id, token_id, sender, recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
     client.pause_recurring_payment(&sender, &id);
     client.cancel_recurring_payment(&sender, &id);
-    let s = client.get_recurring_payment(&id);
+    let s = client.get_schedule(&id);
     assert_eq!(s.status, ScheduleStatus::Cancelled);
 }
 
@@ -422,14 +434,14 @@ fn test_max_executions_marks_schedule_completed() {
 
     advance_time(&env, 86400);
     client.execute_payment(&executor, &id);
-    assert_eq!(client.get_recurring_payment(&id).status, ScheduleStatus::Active);
+    assert_eq!(client.get_schedule(&id).status, ScheduleStatus::Active);
 
     advance_time(&env, 86400);
     client.execute_payment(&executor, &id);
     assert_eq!(count_events(&env, &contract_id, "ScheduleCompleted"), 1);
     // Finished successfully: Completed, not Cancelled.
-    assert_eq!(client.get_recurring_payment(&id).status, ScheduleStatus::Completed);
-    assert_eq!(client.get_recurring_payment(&id).executions_completed, 2);
+    assert_eq!(client.get_schedule(&id).status, ScheduleStatus::Completed);
+    assert_eq!(client.get_schedule(&id).executions_completed, 2);
     assert_eq!(client.get_remaining_executions(&id), Some(0));
     assert!(client.get_active_schedules(&0, &50).is_empty());
 }
@@ -502,7 +514,7 @@ fn test_max_executions_zero_means_unlimited() {
         advance_time(&env, 86400);
         client.execute_payment(&executor, &id);
     }
-    assert_eq!(client.get_recurring_payment(&id).status, ScheduleStatus::Active);
+    assert_eq!(client.get_schedule(&id).status, ScheduleStatus::Active);
     assert_eq!(token_balance(&env, &token_id, &recipient), amount * 5);
 }
 
@@ -513,7 +525,7 @@ fn test_fee_deducted_from_recipient_forwarded_to_admin() {
     let (env, contract_id, token_id, sender, recipient, executor, admin) = setup_with_fee(500); // 5 %
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
     let amount = 1_000_0000000i128;
-    let id = client.authorize_recurring(&sender, &recipient, &amount, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, amount, 86400);
 
     advance_time(&env, 86400);
     client.execute_payment(&executor, &id);
@@ -530,7 +542,7 @@ fn test_zero_fee_sends_full_amount_to_recipient() {
     let (env, contract_id, token_id, sender, recipient, executor, admin) = setup_with_fee(0);
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
     let amount = 1_000_0000000i128;
-    let id = client.authorize_recurring(&sender, &recipient, &amount, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, amount, 86400);
 
     advance_time(&env, 86400);
     client.execute_payment(&executor, &id);
@@ -544,7 +556,7 @@ fn test_fee_accumulates_over_multiple_executions() {
     let (env, contract_id, token_id, sender, recipient, executor, admin) = setup_with_fee(200); // 2 %
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
     let amount = 500_0000000i128;
-    let id = client.authorize_recurring(&sender, &recipient, &amount, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, amount, 86400);
 
     let fee_per_execution = amount * 200 / 10_000;
     let net_per_execution = amount - fee_per_execution;
@@ -585,7 +597,7 @@ fn test_execute_within_grace_period_succeeds() {
 
     // Consecutive misses must remain zero after a successful execution
     assert_eq!(client.get_missed_executions(&id), 0);
-    assert_eq!(client.get_recurring_payment(&id).consecutive_misses, 0);
+    assert_eq!(client.get_schedule(&id).consecutive_misses, 0);
 }
 
 /// Acceptance criterion 2: calling after the grace period records a miss
@@ -893,10 +905,10 @@ fn test_compromised_executor_rapid_calls_cannot_drain_funds() {
 
 #[test]
 #[should_panic(expected = "schedule is not active")]
-fn test_authorize_then_cancel_schedule_fails_execution() {
-    let (env, contract_id, _, sender, recipient, executor, _) = setup();
+fn test_create_then_cancel_schedule_fails_execution() {
+    let (env, contract_id, token_id, sender, recipient, executor, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &recipient, &100_0000000, &86400);
+    let id = create(&client, &token_id, &sender, &recipient, 100_0000000, 86400);
 
     // Cancel the schedule
     client.cancel_recurring_payment(&sender, &id);
@@ -929,9 +941,9 @@ fn test_authorization_expiry_when_max_executions_reached() {
 
 #[test]
 fn test_update_recipient_emits_event_with_old_and_new_addresses() {
-    let (env, contract_id, _, sender, old_recipient, _, _) = setup();
+    let (env, contract_id, token_id, sender, old_recipient, _, _) = setup();
     let client = RecurringPaymentsContractClient::new(&env, &contract_id);
-    let id = client.authorize_recurring(&sender, &old_recipient, &100_0000000, &86400);
+    let id = create(&client, &token_id, &sender, &old_recipient, 100_0000000, 86400);
 
     let new_recipient = Address::generate(&env);
     client.update_recipient(&sender, &id, &new_recipient);

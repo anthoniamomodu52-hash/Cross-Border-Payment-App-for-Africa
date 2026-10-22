@@ -216,6 +216,11 @@ impl RecurringPaymentsContract {
     /// * `max_missed_executions` — Consecutive misses before auto-cancel (default 3,
     ///                             0 means use contract default).
     ///
+    /// Authorization lives only as long as the schedule: cancelling it
+    /// revokes execution, pausing halts it, and it ends after
+    /// `max_executions` payments (if > 0), after `max_missed_executions`
+    /// consecutive misses, or when the sender's token allowance lapses.
+    ///
     /// Returns the new schedule ID.
     pub fn create_recurring_payment(
         env: Env,
@@ -319,46 +324,6 @@ impl RecurringPaymentsContract {
         );
 
         id
-    }
-
-    /// Pre-authorization semantics, replay/expiry rules, and schedule lifecycle:
-    ///
-    /// - **Authorization vs Schedule Lifetime**: Pre-authorization is tied strictly
-    ///   to the underlying `RecurringSchedule` identified by `schedule_id`. Cancelling the schedule
-    ///   via `cancel_recurring_payment` permanently revokes execution authority; any subsequent
-    ///   `execute_payment` calls will fail with `"schedule is not active"`. Pausing the schedule
-    ///   via `pause_recurring_payment` immediately halts payment execution with `"Schedule is paused"`.
-    ///   There is no separate authorization object that survives or outlives a cancelled or paused schedule.
-    /// - **Replay Protection**: Each payment execution checks timing (`now >= next_payment_at`)
-    ///   and advances `next_payment_at` monotonically by `interval`, preventing double execution
-    ///   or replay attacks within the same interval window.
-    /// - **Authorization Expiry**: Pre-authorization expires when `max_executions` is reached (if > 0),
-    ///   when `max_missed_executions` consecutive missed windows occur (which auto-cancels the schedule),
-    ///   or when the token allowance / approval granted off-chain by the sender expires or is revoked.
-    ///
-    /// Deprecated alias for create_recurring_payment. Use create_recurring_payment instead.
-    #[deprecated]
-    pub fn authorize_recurring(
-        env: Env,
-        sender: Address,
-        recipient: Address,
-        amount: i128,
-        interval: IntervalSecs,
-    ) -> u64 {
-        // Legacy support: default to USDC asset (0-address as placeholder).
-        // Uses contract defaults for grace_period_secs and max_missed_executions.
-        let usdc_placeholder = Address::from_contract_id(&env, &[0u8; 32]);
-        Self::create_recurring_payment(
-            env,
-            sender,
-            recipient,
-            usdc_placeholder,
-            amount,
-            interval,
-            0,
-            DEFAULT_GRACE_PERIOD_SECS,
-            DEFAULT_MAX_MISSED_EXECUTIONS,
-        )
     }
 
     /// Execute a due payment for `schedule_id`. Anyone may call this.
@@ -647,24 +612,12 @@ impl RecurringPaymentsContract {
         );
     }
 
-    /// Deprecated alias for cancel_recurring_payment. Use cancel_recurring_payment instead.
-    #[deprecated]
-    pub fn cancel_recurring(env: Env, sender: Address, schedule_id: u64) {
-        Self::cancel_recurring_payment(env, sender, schedule_id)
-    }
-
     /// Read a schedule by ID.
     pub fn get_schedule(env: Env, schedule_id: u64) -> RecurringSchedule {
         env.storage()
             .persistent()
             .get(&DataKey::Schedule(schedule_id))
             .expect("schedule not found")
-    }
-
-    /// Deprecated alias for get_schedule. Use get_schedule instead.
-    #[deprecated]
-    pub fn get_recurring_payment(env: Env, schedule_id: u64) -> RecurringSchedule {
-        Self::get_schedule(env, schedule_id)
     }
 
     /// Update the payment amount for a recurring schedule. Only the sender may update.
@@ -805,14 +758,6 @@ impl RecurringPaymentsContract {
             i = i.saturating_add(1);
         }
         result
-    }
-
-    /// Returns the full schedule struct for a given ID.
-    pub fn get_schedule_by_id(env: Env, schedule_id: u64) -> RecurringSchedule {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Schedule(schedule_id))
-            .expect("schedule not found")
     }
 
     /// Returns paginated IDs of schedules with Active status.

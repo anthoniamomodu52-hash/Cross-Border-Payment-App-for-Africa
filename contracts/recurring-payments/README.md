@@ -12,11 +12,19 @@ A Soroban smart contract that lets users authorize on-chain recurring transfers 
 
 | Function | Auth required | Description |
 |---|---|---|
-| `initialize(token_address)` | — | One-time setup, stores the token contract address |
-| `authorize_recurring(sender, recipient, amount, interval)` | sender | Creates a recurring schedule, returns schedule ID |
+| `initialize(admin, token_address, fee_bps)` | — | One-time setup: admin, token contract and fee |
+| `create_recurring_payment(sender, recipient, asset, amount, interval, max_executions, grace_period_secs, max_missed_executions)` | sender | Creates a recurring schedule, returns schedule ID |
 | `execute_payment(executor, schedule_id)` | executor | Executes a due payment; anyone may call this |
-| `cancel_recurring(sender, schedule_id)` | sender | Cancels an active schedule |
+| `pause_recurring_payment(sender, schedule_id)` / `resume_recurring_payment(sender, schedule_id)` | sender | Pause or resume a schedule |
+| `cancel_recurring_payment(sender, schedule_id)` | sender | Cancels an active or paused schedule |
+| `update_amount(sender, schedule_id, new_amount)` / `update_recipient(sender, schedule_id, new_recipient)` | sender | Change future payments |
 | `get_schedule(schedule_id)` | — | Read a schedule by ID |
+| `get_user_schedules(sender, start, limit)` / `get_active_schedules(start, limit)` | — | Paginated schedule IDs |
+| `get_missed_executions(schedule_id)` / `get_remaining_executions(schedule_id)` | — | Miss counter / payments left |
+
+The old aliases `authorize_recurring`, `cancel_recurring`, `get_recurring_payment`
+and `get_schedule_by_id` were removed. Use `create_recurring_payment`,
+`cancel_recurring_payment` and `get_schedule` instead.
 
 ## Schedule lifecycle
 
