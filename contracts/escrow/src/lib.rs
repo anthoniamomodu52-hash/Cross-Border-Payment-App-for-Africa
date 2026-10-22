@@ -112,6 +112,13 @@ pub struct FeesWithdrawn {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct CancelHoldPeriodUpdated {
+    pub old_hold_secs: u64,
+    pub new_hold_secs: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct FeeUpdated {
     pub escrow_id: u64,
     pub old_fee_bps: u32,
@@ -176,10 +183,24 @@ pub enum DataKey {
     KycContractAddress,
     DisputeContractAddress,
     ContractVersion,
+    /// Minimum seconds an escrow must be held before the sender may cancel it.
+    CancelHoldSecs,
 }
 
 const DEFAULT_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
 const DEFAULT_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
+
+/// Default minimum hold period before a sender may cancel (24 hours).
+///
+/// Gives the agent a guaranteed window to pay out fiat off-chain and land
+/// `confirm_delivery` before the sender can pull the funds back. Without it a
+/// sender could watch for the off-chain payout and front-run the agent's
+/// confirmation with `cancel_escrow`, keeping both the fiat and the refund.
+const DEFAULT_CANCEL_HOLD_SECS: u64 = 24 * 60 * 60;
+
+/// Upper bound for the configurable hold period. Must stay below the escrow
+/// expiry so the sender always gets a cancel window before expiry.
+const MAX_CANCEL_HOLD_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Maximum allowed fee: 10% (1000 bps) per issue #766.
 const MAX_FEE_BPS: u32 = 1000;
@@ -202,6 +223,13 @@ fn require_admin(env: &Env, admin: &Address) {
     if admin != &stored_admin {
         panic!("Only admin can perform this action");
     }
+}
+
+fn cancel_hold_period(env: &Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CancelHoldSecs)
+        .unwrap_or(DEFAULT_CANCEL_HOLD_SECS)
 }
 
 fn retention_period(env: &Env) -> u64 {
@@ -760,6 +788,43 @@ impl EscrowContract {
             .set(&DataKey::RetentionPeriodSecs, &retention_secs);
     }
 
+    /// Set the minimum hold period (seconds) before a sender may cancel an
+    /// escrow. Admin only. Applies to all pending escrows, measured from each
+    /// escrow's `created_at`. Must be at most 7 days.
+    pub fn set_cancel_hold_period(env: Env, admin: Address, hold_secs: u64) {
+        require_admin(&env, &admin);
+        if hold_secs > MAX_CANCEL_HOLD_SECS {
+            panic!("Hold period exceeds maximum of 7 days");
+        }
+        let old_hold_secs = cancel_hold_period(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancelHoldSecs, &hold_secs);
+        env.events().publish(
+            (Symbol::new(&env, "CancelHoldPeriodUpdated"),),
+            CancelHoldPeriodUpdated {
+                old_hold_secs,
+                new_hold_secs: hold_secs,
+            },
+        );
+    }
+
+    /// Returns the current cancel hold period in seconds.
+    pub fn get_cancel_hold_period(env: Env) -> u64 {
+        cancel_hold_period(&env)
+    }
+
+    /// Returns the earliest ledger timestamp at which the sender may cancel
+    /// `escrow_id`.
+    pub fn get_cancellable_at(env: Env, escrow_id: u64) -> u64 {
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .unwrap_or_else(|| panic!("Escrow {} not found", escrow_id));
+        escrow.created_at.saturating_add(cancel_hold_period(&env))
+    }
+
     /// Permissionless cleanup of released/cancelled escrows past the retention
     /// period, callable by anyone to reclaim storage rent. Mirrors the
     /// permissionless `expire_escrow` pattern to avoid adding a snooping burden
@@ -789,6 +854,12 @@ impl EscrowContract {
         );
     }
 
+    /// Sender cancels a pending escrow and receives a full refund.
+    ///
+    /// Only allowed once the cancel hold period (default 24 h, see
+    /// [`Self::set_cancel_hold_period`]) has elapsed since creation, and only
+    /// while the agent has not yet confirmed delivery. The hold period stops a
+    /// sender from front-running an agent who is paying out fiat off-chain.
     pub fn cancel_escrow(env: Env, sender: Address, escrow_id: u64) {
         sender.require_auth();
 
@@ -806,6 +877,10 @@ impl EscrowContract {
         }
         if escrow.payout_confirmed {
             panic!("Cannot cancel: agent has confirmed delivery");
+        }
+        let cancellable_at = escrow.created_at.saturating_add(cancel_hold_period(&env));
+        if env.ledger().timestamp() < cancellable_at {
+            panic!("Cannot cancel: hold period has not elapsed");
         }
 
         let usdc_address: Address = env
