@@ -28,8 +28,7 @@ fn setup() -> (
     let arbitrator = Address::generate(&env);
     let super_arbitrator = Address::generate(&env);
     let usdc_id = env
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
+        .register_stellar_asset_contract(admin.clone());
     client.initialize(&admin, &arbitrator, &usdc_id, &256u32, &super_arbitrator);
     (env, client, admin, arbitrator, usdc_id, super_arbitrator)
 }
@@ -710,13 +709,27 @@ fn test_set_escrow_contract_non_admin_panics() {
 }
 
 #[test]
-#[should_panic(expected = "unauthorized: caller is not the escrow contract")]
+#[should_panic]
 fn test_open_escrow_dispute_non_escrow_caller_panics() {
     let (env, client, admin, _, _, _) = setup();
     let escrow = Address::generate(&env);
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     client.set_escrow_contract(&admin, &escrow);
-    // A top-level caller is not the escrow contract, so this must be rejected.
+    // Drop the blanket auth mock: a caller that is not the escrow contract
+    // cannot produce `escrow.require_auth()`, so this must be rejected.
+    env.set_auths(&[]);
     client.open_escrow_dispute(&escrow, &sender, &recipient, &500_0000000);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: escrow contract not registered")]
+fn test_open_escrow_dispute_unregistered_escrow_panics() {
+    let (env, client, admin, _, _, _) = setup();
+    let escrow = Address::generate(&env);
+    let impostor = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    client.set_escrow_contract(&admin, &escrow);
+    client.open_escrow_dispute(&impostor, &sender, &recipient, &500_0000000);
 }
