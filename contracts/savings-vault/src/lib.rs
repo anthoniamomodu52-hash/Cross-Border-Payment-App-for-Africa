@@ -4,7 +4,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Sym
 #[cfg(test)]
 mod test;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct DepositEvent {
     pub user: Address,
@@ -13,7 +13,7 @@ pub struct DepositEvent {
     pub unlock_time: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct WithdrawalEvent {
     pub user: Address,
@@ -22,7 +22,7 @@ pub struct WithdrawalEvent {
     pub penalty: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct AccrueInterestEvent {
     pub user: Address,
@@ -31,7 +31,7 @@ pub struct AccrueInterestEvent {
     pub new_balance: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct YieldDistributed {
     pub total_amount: i128,
@@ -39,14 +39,14 @@ pub struct YieldDistributed {
     pub recipient_count: u32,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct YieldClaimed {
     pub user: Address,
     pub amount: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct InterestRateUpdatedEvent {
     pub admin: Address,
@@ -55,7 +55,7 @@ pub struct InterestRateUpdatedEvent {
     pub timestamp: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct InterestReserveFundedEvent {
     pub distributor: Address,
@@ -63,7 +63,7 @@ pub struct InterestReserveFundedEvent {
     pub new_reserve: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct InsufficientReserveEvent {
     pub user: Address,
@@ -73,21 +73,21 @@ pub struct InsufficientReserveEvent {
     pub timestamp: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EmergencyAnnouncedEvent {
     pub admin: Address,
     pub timestamp: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EmergencyCancelledEvent {
     pub admin: Address,
     pub timestamp: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EmergencyWithdrawnEvent {
     pub admin: Address,
@@ -102,7 +102,7 @@ pub struct EmergencyWithdrawnEvent {
     pub timestamp: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct LockBoundsUpdated {
     pub old_min: u64,
@@ -111,6 +111,7 @@ pub struct LockBoundsUpdated {
     pub new_max: u64,
 }
 
+#[derive(Debug, Clone)]
 /// One independent savings position. A user may hold several, each with its
 /// own unlock time (mirrors the backend's `savings_vaults` rows).
 #[derive(Clone)]
@@ -122,6 +123,7 @@ pub struct Vault {
     pub accrued_interest: i128,
 }
 
+#[derive(Debug)]
 #[contracttype]
 pub enum DataKey {
     Admin,

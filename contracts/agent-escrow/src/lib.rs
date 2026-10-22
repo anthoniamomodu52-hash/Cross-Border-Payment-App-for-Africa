@@ -18,6 +18,7 @@ mod test;
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -42,6 +43,7 @@ const MAX_INSURANCE_CONTRIBUTION_BPS: u32 = 1_000;
 // ── Domain types ──────────────────────────────────────────────────────────────
 
 /// Status of an agent escrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[contracttype]
 pub enum EscrowStatus {
@@ -54,7 +56,7 @@ pub enum EscrowStatus {
 }
 
 /// On-chain record for a single agent escrow.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct AgentEscrow {
     pub id: u64,
@@ -76,7 +78,7 @@ pub struct AgentEscrow {
 // ── Event payloads ────────────────────────────────────────────────────────────
 
 /// Emitted by `create_escrow`. Topics: ("AgentEscrow", "EscrowCreated").
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtEscrowCreated {
     pub escrow_id: u64,
@@ -89,7 +91,7 @@ pub struct EvtEscrowCreated {
 
 /// Emitted by `confirm_payout` and `admin_release` (to_agent=true).
 /// Topics: ("AgentEscrow", "EscrowConfirmed").
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtEscrowConfirmed {
     pub escrow_id: u64,
@@ -100,7 +102,7 @@ pub struct EvtEscrowConfirmed {
 
 /// Emitted by `cancel_escrow` and `admin_release` (to_agent=false).
 /// Topics: ("AgentEscrow", "EscrowCancelled").
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtEscrowCancelled {
     pub escrow_id: u64,
@@ -110,7 +112,7 @@ pub struct EvtEscrowCancelled {
 
 /// Emitted by `admin_release` in addition to the outcome event.
 /// Topics: ("AgentEscrow", "AdminOverride").
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct AdminOverride {
     pub escrow_id: u64,
@@ -120,25 +122,26 @@ pub struct AdminOverride {
     pub reason: Symbol,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct InsuranceFundContribution {
     pub escrow_id: u64,
     pub amount: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtAgentRegistered {
     pub agent: Address,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtAgentRemoved {
     pub agent: Address,
 }
 
+#[derive(Debug, Clone)]
 /// Emitted by `withdraw_fees`. Topics: ("FeesWithdrawn",).
 /// Lets the off-chain indexer and auditors track platform fee withdrawals.
 #[derive(Clone)]
@@ -168,6 +171,7 @@ pub struct InsurancePayout {
     pub amount: i128,
 }
 
+#[derive(Debug, Clone)]
 /// Emitted by `update_admin`. Topics: ("AdminUpdated",).
 #[derive(Clone)]
 #[contracttype]

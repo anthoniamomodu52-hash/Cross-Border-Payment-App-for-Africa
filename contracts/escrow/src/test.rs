@@ -1,4 +1,5 @@
 #![cfg(test)]
+extern crate std;
 
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
@@ -14,7 +15,7 @@ use crate::{
 fn setup() -> (Env, EscrowContractClient<'static>, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, EscrowContract);
+    let contract_id = env.register(EscrowContract, ());
     let client = EscrowContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
     let usdc_id = env.register_stellar_asset_contract(admin.clone());
@@ -398,6 +399,12 @@ fn test_confirm_delivery_prevents_cancel() {
     let escrow = client.get_escrow(&escrow_id);
     assert!(escrow.payout_confirmed);
 
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.cancel_escrow(&sender, &escrow_id);
+    }));
+    assert!(result.is_err());
+    let error_message = panic_msg(result.err().unwrap());
+    assert!(error_message.contains("Cannot cancel: agent has confirmed delivery"));
     assert!(client.try_cancel_escrow(&sender, &escrow_id).is_err());
 }
 
@@ -475,6 +482,14 @@ fn test_partial_release_basic() {
     let expected_agent = 400_0000000i128 - expected_fee;
     assert_eq!(TokenClient::new(&env, &usdc_id).balance(&agent), expected_agent);
 
+    let event_name: Val = Symbol::new(&env, "PartialRelease").into_val(&env);
+    let events = all_events(&env);
+    let pr_event = events.iter().find(|(_, topics, _)| {
+        topics.iter().any(|topic| val_eq(&env, &topic, &event_name))
+    });
+    assert!(pr_event.is_some(), "PartialRelease event not emitted");
+    let (_, _, data) = pr_event.unwrap();
+    let payload: PartialRelease = soroban_sdk::FromVal::from_val(&env, &data);
     let pr_event = find_event(&env, "PartialRelease");
     assert!(pr_event.is_some(), "PartialRelease event not emitted");
     let (_, _, data) = pr_event.unwrap();
@@ -563,6 +578,14 @@ fn test_partial_release_event_fields() {
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &250);
     client.partial_release(&agent, &escrow_id, &600_0000000i128);
 
+    let event_name: Val = Symbol::new(&env, "PartialRelease").into_val(&env);
+    let events = all_events(&env);
+    let pr_event = events.iter().find(|(_, topics, _)| {
+        topics.iter().any(|topic| val_eq(&env, &topic, &event_name))
+    });
+    assert!(pr_event.is_some(), "PartialRelease event not emitted");
+    let (_, _, data) = pr_event.unwrap();
+    let payload: PartialRelease = soroban_sdk::FromVal::from_val(&env, &data);
     let pr_event = find_event(&env, "PartialRelease");
     assert!(pr_event.is_some(), "PartialRelease event not emitted");
     let (_, _, data) = pr_event.unwrap();
@@ -593,6 +616,12 @@ fn test_cleanup_escrow_after_retention() {
 
     client.cleanup_escrow(&escrow_id);
 
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.get_escrow(&escrow_id);
+    }));
+    assert!(result.is_err());
+    let err_str = panic_msg(result.err().unwrap());
+    assert!(err_str.contains("Escrow 1 not found"));
     assert!(client.try_get_escrow(&escrow_id).is_err());
 }
 
@@ -618,6 +647,12 @@ fn test_cleanup_escrow_is_permissionless() {
     // Called by an arbitrary address, not the admin.
     client.cleanup_escrow(&escrow_id);
 
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.get_escrow(&escrow_id);
+    }));
+    assert!(result.is_err());
+    let err_str = panic_msg(result.err().unwrap());
+    assert!(err_str.contains("Escrow 1 not found"));
     assert!(client.try_get_escrow(&escrow_id).is_err());
     let _ = &someone;
 }
@@ -726,11 +761,17 @@ fn test_withdraw_fees_emits_event() {
     let expected_fee = (amount * fee_bps as i128) / 10000;
     client.withdraw_fees(&admin, &expected_fee);
 
+    let event_name: Val = Symbol::new(&env, "FeesWithdrawn").into_val(&env);
+    let events = all_events(&env);
+    let fee_event = events.iter().find(|(_, topics, _)| {
+        topics.iter().any(|topic| val_eq(&env, &topic, &event_name))
+    });
     let fee_event = find_event(&env, "FeesWithdrawn");
 
     assert!(fee_event.is_some(), "FeesWithdrawn event not emitted");
 
     let (_, _, data) = fee_event.unwrap();
+    let payload: FeesWithdrawn = soroban_sdk::FromVal::from_val(&env, &data);
     let payload = FeesWithdrawn::from_val(&env, &data);
 
     assert_eq!(payload.admin, admin);
@@ -1018,11 +1059,17 @@ fn test_deposit_emits_escrow_deposited_event() {
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &250);
     client.deposit(&sender, &escrow_id, &deposit_amount);
 
+    let event_name: Val = Symbol::new(&env, "EscrowDeposited").into_val(&env);
+    let events = all_events(&env);
+    let deposit_event = events.iter().find(|(_, topics, _)| {
+        topics.iter().any(|topic| val_eq(&env, &topic, &event_name))
+    });
     let deposit_event = find_event(&env, "EscrowDeposited");
 
     assert!(deposit_event.is_some(), "EscrowDeposited event not emitted");
 
     let (_, _, data) = deposit_event.unwrap();
+    let payload: EscrowDeposited = soroban_sdk::FromVal::from_val(&env, &data);
     let payload = EscrowDeposited::from_val(&env, &data);
 
     assert_eq!(payload.escrow_id, escrow_id);
@@ -1053,10 +1100,10 @@ fn setup_with_dispute() -> (
     let env = Env::default();
     env.mock_all_auths();
 
-    let escrow_contract_id = env.register_contract(None, EscrowContract);
+    let escrow_contract_id = env.register(EscrowContract, ());
     let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
 
-    let dispute_resolution_id = env.register_contract(None, DisputeResolutionContract);
+    let dispute_resolution_id = env.register(DisputeResolutionContract, ());
     let dispute_client = DisputeResolutionContractClient::new(&env, &dispute_resolution_id);
 
     let admin = Address::generate(&env);
@@ -1178,6 +1225,15 @@ fn test_disputed_escrow_cannot_be_cancelled_or_released() {
     mint_usdc(&env, &usdc_id, &admin, &sender, DISPUTE_FILING_FEE);
     escrow.dispute_escrow(&sender, &escrow_id);
 
+    let cancel_err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| escrow.cancel_escrow(&sender, &escrow_id)));
+    assert!(cancel_err.is_err());
+    assert!(panic_msg(cancel_err.err().unwrap())
+        .contains("Escrow is not in pending state"));
+
+    let release_err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| escrow.release_escrow(&agent, &escrow_id)));
+    assert!(release_err.is_err());
+    assert!(panic_msg(release_err.err().unwrap())
+        .contains("Escrow is not in pending state"));
     assert!(escrow.try_cancel_escrow(&sender, &escrow_id).is_err());
     assert!(escrow.try_release_escrow(&agent, &escrow_id).is_err());
 }
@@ -1468,6 +1524,54 @@ fn test_partial_release_becomes_full_release_when_amount_zero() {
     assert_eq!(escrow.status, EscrowStatus::Released);
 }
 
+/// Events emitted so far, as `(contract, topics, data)` tuples.
+///
+/// soroban-sdk 23+ returns events in XDR form; this converts them back to
+/// host values so tests can decode payloads with `FromVal`.
+#[allow(dead_code)]
+fn all_events(
+    env: &soroban_sdk::Env,
+) -> soroban_sdk::Vec<(
+    soroban_sdk::Address,
+    soroban_sdk::Vec<soroban_sdk::Val>,
+    soroban_sdk::Val,
+)> {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{xdr, Address, TryFromVal, Val, Vec};
+    let mut out = Vec::new(env);
+    for e in env.events().all().events() {
+        let xdr::ContractEventBody::V0(body) = &e.body;
+        let Some(contract_id) = e.contract_id.clone() else {
+            continue;
+        };
+        let contract =
+            Address::try_from_val(env, &xdr::ScAddress::Contract(contract_id)).unwrap();
+        let mut topics: Vec<Val> = Vec::new(env);
+        for t in body.topics.iter() {
+            topics.push_back(Val::try_from_val(env, t).unwrap());
+        }
+        out.push_back((contract, topics, Val::try_from_val(env, &body.data).unwrap()));
+    }
+    out
+}
+
+/// Compares two host values structurally (`Val` has no `PartialEq`).
+#[allow(dead_code)]
+fn val_eq(env: &soroban_sdk::Env, a: &soroban_sdk::Val, b: &soroban_sdk::Val) -> bool {
+    use soroban_sdk::{xdr::ScVal, TryFromVal};
+    ScVal::try_from_val(env, a).ok() == ScVal::try_from_val(env, b).ok()
+}
+
+/// Extracts the message from a caught panic payload.
+fn panic_msg(err: std::boxed::Box<dyn core::any::Any + Send>) -> std::string::String {
+    use std::string::{String, ToString};
+    if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = err.downcast_ref::<&str>() {
+        s.to_string()
+    } else {
+        String::new()
+    }
 // ── #1365: update_fee cannot raise the fee of a funded escrow ─────────────────
 
 fn create_default_escrow(

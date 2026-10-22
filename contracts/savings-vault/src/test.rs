@@ -11,6 +11,10 @@ use crate::{AccrueInterestEvent, DepositEvent, SavingsVaultContract, SavingsVaul
 fn setup() -> (Env, SavingsVaultContractClient<'static>, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
+    // Start at a realistic ledger time: the contract uses 0 to mean "no
+    // emergency announced", so announcing at timestamp 0 would be invisible.
+    env.ledger().with_mut(|li| li.timestamp = 1_700_000_000);
+    let contract_id = env.register(SavingsVaultContract, ());
     // Start from a realistic timestamp: the contract uses 0 as the
     // "not announced" sentinel, and some tests subtract from `now`.
     env.ledger().set_timestamp(1_700_000_000);
@@ -22,6 +26,9 @@ fn setup() -> (Env, SavingsVaultContractClient<'static>, Address, Address) {
     (env, client, admin, usdc_id)
 }
 
+/// Mints `amount` USDC to `to` and approves the vault to pull it: `deposit`
+/// collects funds with `transfer_from`, so an allowance is required.
+fn mint_usdc(env: &Env, usdc_id: &Address, vault: &Address, to: &Address, amount: i128) {
 /// True if `topics` contains the symbol `name` (compared by value, not handle).
 fn topic_is(env: &Env, topics: &soroban_sdk::Vec<Val>, name: &str) -> bool {
     let want = Symbol::new(env, name);
@@ -32,6 +39,9 @@ fn topic_is(env: &Env, topics: &soroban_sdk::Vec<Val>, name: &str) -> bool {
 
 fn mint_usdc(env: &Env, usdc_id: &Address, _admin: &Address, to: &Address, amount: i128) {
     StellarAssetClient::new(env, usdc_id).mint(to, &amount);
+    let token = TokenClient::new(env, usdc_id);
+    let allowance = token.allowance(to, vault);
+    token.approve(to, vault, &(allowance + amount), &(env.ledger().sequence() + 100_000));
 }
 
 #[test]
@@ -55,7 +65,7 @@ fn test_deposit() {
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
 
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
 
     client.deposit(&user, &amount, &unlock_time);
 
@@ -79,7 +89,7 @@ fn test_deposit_past_unlock_time() {
     let amount = 1_000_0000000i128;
     let past_time = env.ledger().timestamp() - 1;
 
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &past_time);
 }
 
@@ -90,7 +100,7 @@ fn test_withdraw_after_unlock() {
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86_400;
 
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
 
     env.ledger().set_timestamp(unlock_time + 1);
@@ -108,7 +118,7 @@ fn test_early_withdrawal_with_penalty() {
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
 
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
 
     client.withdraw(&user, &0, &amount);
@@ -126,6 +136,7 @@ fn test_early_withdrawal_with_penalty() {
 fn test_configurable_penalty_bps() {
     let env = Env::default();
     env.mock_all_auths();
+    let contract_id = env.register(SavingsVaultContract, ());
     // Start from a realistic timestamp: the contract uses 0 as the
     // "not announced" sentinel, and some tests subtract from `now`.
     env.ledger().set_timestamp(1_700_000_000);
@@ -140,7 +151,7 @@ fn test_configurable_penalty_bps() {
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
 
-    StellarAssetClient::new(&env, &usdc_id).mint(&user, &amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
     client.withdraw(&user, &0, &amount);
 
@@ -154,6 +165,7 @@ fn test_configurable_penalty_bps() {
 fn test_zero_penalty_bps_no_penalty_on_early_withdrawal() {
     let env = Env::default();
     env.mock_all_auths();
+    let contract_id = env.register(SavingsVaultContract, ());
     // Start from a realistic timestamp: the contract uses 0 as the
     // "not announced" sentinel, and some tests subtract from `now`.
     env.ledger().set_timestamp(1_700_000_000);
@@ -168,7 +180,7 @@ fn test_zero_penalty_bps_no_penalty_on_early_withdrawal() {
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
 
-    StellarAssetClient::new(&env, &usdc_id).mint(&user, &amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
     client.withdraw(&user, &0, &amount);
 
@@ -184,7 +196,7 @@ fn test_withdraw_more_than_balance() {
     let withdraw_amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86_400;
 
-    mint_usdc(&env, &usdc_id, &admin, &user, deposit_amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, deposit_amount);
     client.deposit(&user, &deposit_amount, &unlock_time);
 
     client.withdraw(&user, &0, &withdraw_amount);
@@ -207,9 +219,10 @@ fn test_multiple_deposits_create_independent_vaults() {
     let amount1 = 500_0000000i128;
     let amount2 = 300_0000000i128;
     let unlock_time1 = env.ledger().timestamp() + 86_400;
+    let unlock_time2 = env.ledger().timestamp() + 2 * 86_400;
     let unlock_time2 = env.ledger().timestamp() + 172_800;
 
-    mint_usdc(&env, &usdc_id, &admin, &user, amount1 + amount2);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount1 + amount2);
 
     let id1 = client.deposit(&user, &amount1, &unlock_time1);
     let id2 = client.deposit(&user, &amount2, &unlock_time2);
@@ -254,10 +267,11 @@ fn test_deposit_with_earlier_unlock_keeps_requested_time() {
     let user = Address::generate(&env);
     let amount1 = 500_0000000i128;
     let amount2 = 300_0000000i128;
+    let unlock_time1 = env.ledger().timestamp() + 2 * 86_400;
     let unlock_time1 = env.ledger().timestamp() + 172_800;
     let unlock_time2 = env.ledger().timestamp() + 86_400; // earlier than first
 
-    mint_usdc(&env, &usdc_id, &admin, &user, amount1 + amount2);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount1 + amount2);
 
     let id1 = client.deposit(&user, &amount1, &unlock_time1);
     let id2 = client.deposit(&user, &amount2, &unlock_time2);
@@ -312,7 +326,7 @@ fn test_get_vault_returns_full_info() {
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
 
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
 
     let vault = client.get_vault(&user, &0);
@@ -322,6 +336,9 @@ fn test_get_vault_returns_full_info() {
 
 #[test]
 fn test_get_vault_no_deposit_returns_zeros() {
+    let (_, client, _, _) = setup();
+    let user = Address::generate(&client.env);
+    let vault = client.get_vault(&user);
     let (env, client, _, _) = setup();
     let user = Address::generate(&env);
     let vault = client.get_vault(&user, &0);
@@ -332,6 +349,8 @@ fn test_get_vault_no_deposit_returns_zeros() {
 
 #[test]
 fn test_get_balance_no_vault() {
+    let (_, client, _, _) = setup();
+    let user = Address::generate(&client.env);
     let (env, client, _, _) = setup();
     let user = Address::generate(&env);
     assert_eq!(client.get_balance(&user), 0);
@@ -339,6 +358,9 @@ fn test_get_balance_no_vault() {
 
 #[test]
 fn test_get_unlock_time_no_vault() {
+    let (_, client, _, _) = setup();
+    let user = Address::generate(&client.env);
+    assert_eq!(client.get_unlock_time(&user), 0);
     let (env, client, _, _) = setup();
     let user = Address::generate(&env);
     assert_eq!(client.get_unlock_time(&user, &0), 0);
@@ -349,6 +371,12 @@ fn test_announce_emergency_sets_timestamp() {
     let (env, client, admin, _) = setup();
     client.announce_emergency(&admin);
 
+    let event_name: Val = Symbol::new(&env, "EmergencyAnnounced").into_val(&env);
+    let events = all_events(&env);
+    assert_eq!(events.len(), 1);
+    let event = events
+        .iter()
+        .find(|(_, topics, _)| topics.iter().any(|t| val_eq(&env, &t, &event_name)))
     let event_name = "EmergencyAnnounced";
     let events = env.events().all();
     assert_eq!(events.len(), 1);
@@ -367,7 +395,7 @@ fn test_emergency_withdraw_after_delay() {
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
 
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
     client.announce_emergency(&admin);
 
@@ -388,7 +416,7 @@ fn test_emergency_withdraw_before_delay_panics() {
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
 
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
     client.announce_emergency(&admin);
 
@@ -401,6 +429,11 @@ fn test_cancel_emergency_before_delay() {
     client.announce_emergency(&admin);
     client.cancel_emergency(&admin);
 
+    let event_name: Val = Symbol::new(&env, "EmergencyCancelled").into_val(&env);
+    let events = all_events(&env);
+    assert!(events
+        .iter()
+        .any(|(_, topics, _)| topics.iter().any(|t| val_eq(&env, &t, &event_name))));
     let events = env.events().all();
     let event_name = "EmergencyCancelled";
     assert!(events.iter().any(|(_, topics, _)| topic_is(&env, &topics, event_name)));
@@ -419,6 +452,9 @@ fn test_cancel_emergency_without_announcement_panics() {
 fn test_activate_emergency_sets_state() {
     let (env, client, admin, _) = setup();
     client.activate_emergency(&admin);
+    let event_name: Val = Symbol::new(&env, "EmergencyActivated").into_val(&env);
+    let events = all_events(&env);
+    assert!(events.iter().any(|(_, topics, _)| topics.iter().any(|t| val_eq(&env, &t, &event_name))));
     let event_name = "EmergencyActivated";
     let events = env.events().all();
     assert!(events.iter().any(|(_, topics, _)| topic_is(&env, &topics, event_name)));
@@ -429,6 +465,9 @@ fn test_deactivate_emergency_cancels() {
     let (env, client, admin, _) = setup();
     client.activate_emergency(&admin);
     client.deactivate_emergency(&admin);
+    let event_name: Val = Symbol::new(&env, "EmergencyCancelled").into_val(&env);
+    let events = all_events(&env);
+    assert!(events.iter().any(|(_, topics, _)| topics.iter().any(|t| val_eq(&env, &t, &event_name))));
     let event_name = "EmergencyCancelled";
     let events = env.events().all();
     assert!(events.iter().any(|(_, topics, _)| topic_is(&env, &topics, event_name)));
@@ -447,7 +486,7 @@ fn test_emergency_return_funds_after_48h() {
     let user = Address::generate(&env);
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
     client.activate_emergency(&admin);
     env.ledger().set_timestamp(env.ledger().timestamp() + 172_800);
@@ -464,7 +503,7 @@ fn test_emergency_return_funds_before_48h_panics() {
     let user = Address::generate(&env);
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
     client.activate_emergency(&admin);
     client.emergency_return_funds(&admin, &user);
@@ -476,7 +515,7 @@ fn test_normal_withdraw_during_emergency_succeeds() {
     let user = Address::generate(&env);
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
     client.activate_emergency(&admin);
     // user can still self-withdraw during emergency window
@@ -506,9 +545,10 @@ fn test_accrue_interest_credits_vault_balance() {
     let (env, client, admin, usdc_id) = setup();
     let user = Address::generate(&env);
     let deposit = 1_000_0000000i128; // 1000 USDC
+    let unlock_time = env.ledger().timestamp() + 365 * 24 * 60 * 60;
     let unlock_time = env.ledger().timestamp() + 31_536_000;
 
-    mint_usdc(&env, &usdc_id, &admin, &user, deposit);
+    mint_usdc(&env, &usdc_id, &client.address, &user, deposit);
     client.deposit(&user, &deposit, &unlock_time);
     client.set_interest_rate(&admin, &500u32); // 5% per year
 
@@ -528,15 +568,20 @@ fn test_accrue_interest_emits_event() {
     let (env, client, admin, usdc_id) = setup();
     let user = Address::generate(&env);
     let deposit = 1_000_0000000i128;
+    let unlock_time = env.ledger().timestamp() + 365 * 24 * 60 * 60;
     let unlock_time = env.ledger().timestamp() + 31_536_000;
 
-    mint_usdc(&env, &usdc_id, &admin, &user, deposit);
+    mint_usdc(&env, &usdc_id, &client.address, &user, deposit);
     client.deposit(&user, &deposit, &unlock_time);
     client.set_interest_rate(&admin, &500u32);
 
     env.ledger().with_mut(|li| li.timestamp += 31_536_000);
     client.accrue_interest(&user, &0);
 
+    let event_name: Val = Symbol::new(&env, "AccrueInterest").into_val(&env);
+    let events = all_events(&env);
+    let accrual_event = events.iter().find(|(_, topics, _)| {
+        topics.iter().any(|t| val_eq(&env, &t, &event_name))
     let event_name = "AccrueInterest";
     let events = env.events().all();
     let accrual_event = events.iter().find(|(_, topics, _)| {
@@ -545,6 +590,10 @@ fn test_accrue_interest_emits_event() {
     assert!(accrual_event.is_some(), "AccrueInterest event not emitted");
 
     let (_, _, data) = accrual_event.unwrap();
+    let payload: AccrueInterestEvent = soroban_sdk::FromVal::from_val(&env, &data);
+    assert_eq!(payload.user, user);
+    assert_eq!(payload.interest, 50_0000000i128);
+    // Interest accrues into `accrued_interest`; the principal balance is unchanged.
     let payload = AccrueInterestEvent::from_val(&env, &data);
     assert_eq!(payload.user, user);
     assert_eq!(payload.interest, 50_0000000i128);
@@ -560,10 +609,17 @@ fn test_accrue_interest_without_rate_panics() {
     let deposit = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
 
-    mint_usdc(&env, &usdc_id, &admin, &user, deposit);
+    mint_usdc(&env, &usdc_id, &client.address, &user, deposit);
     client.deposit(&user, &deposit, &unlock_time);
 
     env.ledger().with_mut(|li| li.timestamp += 86400);
+    client.accrue_interest(&user);
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_accrue_interest_requires_user_auth() {
+    // accrue_interest is authorised by the vault owner, not the admin.
     client.accrue_interest(&user, &0);
 }
 
@@ -574,10 +630,13 @@ fn test_accrue_interest_is_user_callable() {
     let deposit = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
 
-    mint_usdc(&env, &usdc_id, &admin, &user, deposit);
+    mint_usdc(&env, &usdc_id, &client.address, &user, deposit);
     client.deposit(&user, &deposit, &unlock_time);
     client.set_interest_rate(&admin, &500u32);
 
+    env.ledger().with_mut(|li| li.timestamp += 86400);
+    env.set_auths(&[]);
+    client.accrue_interest(&user);
     // accrue_interest is authorised by the vault owner; no admin needed.
     env.ledger().with_mut(|li| li.timestamp += 86400);
     client.accrue_interest(&user, &0);
@@ -592,10 +651,11 @@ fn test_two_depositors_independent() {
     let amount1 = 1_000_0000000i128;
     let amount2 = 500_0000000i128;
     let unlock_time1 = env.ledger().timestamp() + 86_400;
+    let unlock_time2 = env.ledger().timestamp() + 2 * 86_400;
     let unlock_time2 = env.ledger().timestamp() + 172_800;
 
-    mint_usdc(&env, &usdc_id, &admin, &user1, amount1);
-    mint_usdc(&env, &usdc_id, &admin, &user2, amount2);
+    mint_usdc(&env, &usdc_id, &client.address, &user1, amount1);
+    mint_usdc(&env, &usdc_id, &client.address, &user2, amount2);
 
     client.deposit(&user1, &amount1, &unlock_time1);
     client.deposit(&user2, &amount2, &unlock_time2);
@@ -640,7 +700,7 @@ fn test_emergency_withdraw_without_announcement_panics() {
     let user = Address::generate(&env);
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
     client.emergency_withdraw(&admin, &user);
 }
@@ -652,7 +712,7 @@ fn test_emergency_return_funds_without_activation_panics() {
     let user = Address::generate(&env);
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
     client.emergency_return_funds(&admin, &user);
 }
@@ -664,7 +724,7 @@ fn test_emergency_withdraw_then_return_funds_mutually_exclusive() {
     let user = Address::generate(&env);
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
 
     client.announce_emergency(&admin);
@@ -686,7 +746,7 @@ fn test_emergency_return_funds_then_withdraw_mutually_exclusive() {
     let user = Address::generate(&env);
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
 
     client.announce_emergency(&admin);
@@ -708,7 +768,7 @@ fn test_double_emergency_withdraw_panics() {
     let user = Address::generate(&env);
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
 
     client.announce_emergency(&admin);
@@ -725,7 +785,7 @@ fn test_double_emergency_return_funds_panics() {
     let user = Address::generate(&env);
     let amount = 1_000_0000000i128;
     let unlock_time = env.ledger().timestamp() + 86400;
-    mint_usdc(&env, &usdc_id, &admin, &user, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, amount);
     client.deposit(&user, &amount, &unlock_time);
 
     client.activate_emergency(&admin);
@@ -744,7 +804,7 @@ fn test_deposit_exceeds_max_bound_panics() {
     let user = Address::generate(&env);
     let excessive_amount = crate::MAX_DEPOSIT_AMOUNT + 1;
     let unlock_time = env.ledger().timestamp() + 86400;
-    mint_usdc(&env, &usdc_id, &admin, &user, excessive_amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, excessive_amount);
     client.deposit(&user, &excessive_amount, &unlock_time);
 }
 
@@ -797,8 +857,8 @@ fn test_deposit_at_exact_min_and_max_bounds() {
     let user1 = Address::generate(&env);
     let user2 = Address::generate(&env);
     let amount = 100_0000000i128;
-    mint_usdc(&env, &usdc_id, &admin, &user1, amount);
-    mint_usdc(&env, &usdc_id, &admin, &user2, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user1, amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user2, amount);
 
     let now = env.ledger().timestamp();
     // Exactly min_secs
@@ -823,7 +883,7 @@ fn test_flash_deposit_yield_capture_is_time_weighted() {
 
     let user = Address::generate(&env);
     let deposit_amount = 1_000_0000000i128; // 1,000 USDC
-    mint_usdc(&env, &usdc_id, &admin, &user, deposit_amount);
+    mint_usdc(&env, &usdc_id, &client.address, &user, deposit_amount);
 
     let now = env.ledger().timestamp();
     // Deposit with unlock_time
@@ -861,7 +921,7 @@ fn test_invariant_sum_vault_balances_equals_total_locked() {
     // Checkpoint 1: Initial deposits
     for (i, user) in users.iter().enumerate() {
         let amount = ((i as i128 + 1) * 250) * 10_000_000; // 250, 500, 750, 1000 USDC
-        mint_usdc(&env, &usdc_id, &admin, user, amount);
+        mint_usdc(&env, &usdc_id, &client.address, user, amount);
         let unlock_time = env.ledger().timestamp() + 500 + (i as u64 * 100);
         client.deposit(user, &amount, &unlock_time);
     }
@@ -890,7 +950,7 @@ fn test_invariant_sum_vault_balances_equals_total_locked() {
 
     // Checkpoint 4: Additional deposit and interest accrual
     let extra_deposit = 300_0000000i128;
-    mint_usdc(&env, &usdc_id, &admin, &users[2], extra_deposit);
+    mint_usdc(&env, &usdc_id, &client.address, &users[2], extra_deposit);
     let new_unlock = env.ledger().timestamp() + 1000;
     client.deposit(&users[2], &extra_deposit, &new_unlock);
 
@@ -901,6 +961,42 @@ fn test_invariant_sum_vault_balances_equals_total_locked() {
     assert_eq!(client.get_total_locked(), sum_balances);
 }
 
+/// Events emitted so far, as `(contract, topics, data)` tuples.
+///
+/// soroban-sdk 23+ returns events in XDR form; this converts them back to
+/// host values so tests can decode payloads with `FromVal`.
+#[allow(dead_code)]
+fn all_events(
+    env: &soroban_sdk::Env,
+) -> soroban_sdk::Vec<(
+    soroban_sdk::Address,
+    soroban_sdk::Vec<soroban_sdk::Val>,
+    soroban_sdk::Val,
+)> {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{xdr, Address, TryFromVal, Val, Vec};
+    let mut out = Vec::new(env);
+    for e in env.events().all().events() {
+        let xdr::ContractEventBody::V0(body) = &e.body;
+        let Some(contract_id) = e.contract_id.clone() else {
+            continue;
+        };
+        let contract =
+            Address::try_from_val(env, &xdr::ScAddress::Contract(contract_id)).unwrap();
+        let mut topics: Vec<Val> = Vec::new(env);
+        for t in body.topics.iter() {
+            topics.push_back(Val::try_from_val(env, t).unwrap());
+        }
+        out.push_back((contract, topics, Val::try_from_val(env, &body.data).unwrap()));
+    }
+    out
+}
+
+/// Compares two host values structurally (`Val` has no `PartialEq`).
+#[allow(dead_code)]
+fn val_eq(env: &soroban_sdk::Env, a: &soroban_sdk::Val, b: &soroban_sdk::Val) -> bool {
+    use soroban_sdk::{xdr::ScVal, TryFromVal};
+    ScVal::try_from_val(env, a).ok() == ScVal::try_from_val(env, b).ok()
 // ── Deposits / yield pull funds with a direct transfer (no approve needed) ────
 
 #[test]

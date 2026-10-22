@@ -62,6 +62,7 @@ const DEFAULT_QUORUM_BPS: u32 = 6_001;
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -114,6 +115,7 @@ pub enum DataKey {
 // ── Domain types ──────────────────────────────────────────────────────────────
 
 /// Lifecycle state of a dispute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[contracttype]
 pub enum DisputeStatus {
@@ -137,7 +139,7 @@ pub enum DisputeStatus {
 }
 
 /// On-chain dispute record.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct Dispute {
     pub id: u64,
@@ -167,7 +169,7 @@ pub struct Dispute {
 
 // ── Event payloads ────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtDisputeOpened {
     pub dispute_id: u64,
@@ -177,6 +179,7 @@ pub struct EvtDisputeOpened {
     pub deadline: u64,
 }
 
+#[derive(Debug, Clone)]
 /// Emitted by [`DisputeResolutionContract::open_escrow_dispute`] alongside
 /// `DisputeOpened`, carrying the escrow-specific parties and state.
 #[derive(Clone)]
@@ -204,7 +207,7 @@ pub struct EvtEvidenceSubmitted {
     pub submitted_by: Address,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtDisputeResolved {
     pub dispute_id: u64,
@@ -212,7 +215,7 @@ pub struct EvtDisputeResolved {
     pub amount: i128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtDisputeExpired {
     pub dispute_id: u64,
@@ -221,7 +224,7 @@ pub struct EvtDisputeExpired {
 }
 
 /// Emitted when a party files an appeal within the 24-hour window.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtAppealFiled {
     pub dispute_id: u64,
@@ -229,7 +232,7 @@ pub struct EvtAppealFiled {
 }
 
 /// Emitted when a panel arbitrator casts a vote on a dispute.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtVoteCast {
     pub dispute_id: u64,
@@ -241,7 +244,7 @@ pub struct EvtVoteCast {
 }
 
 /// Emitted when the panel reaches quorum and funds are released.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct EvtQuorumReached {
     pub dispute_id: u64,
@@ -508,6 +511,8 @@ impl DisputeResolutionContract {
         if amount <= 0 {
             panic!("amount must be positive");
         }
+        // A contract calling this function directly authorizes itself, so this
+        // proves the call really comes from `escrow_contract`.
         // A contract calling another contract is implicitly authorized for
         // its own address, so this only passes when `escrow_contract` is the
         // direct caller.
@@ -1459,6 +1464,9 @@ impl DisputeResolutionContract {
             .unwrap_or_else(|| Vec::new(&env));
         
         let total = user_disputes.len();
+        let actual_start = start.min(total);
+        let actual_end = actual_start.saturating_add(capped_limit).min(total);
+        
         let actual_start = if start > total { total } else { start };
         let total: u32 = user_disputes.len();
         let actual_start = start.min(total);

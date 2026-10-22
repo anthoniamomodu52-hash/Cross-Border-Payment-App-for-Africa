@@ -14,6 +14,7 @@ const DEFAULT_MAX_MISSED_EXECUTIONS: u64 = 3;
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 #[contracttype]
 pub enum DataKey {
     TokenAddress,
@@ -34,6 +35,7 @@ pub enum DataKey {
 /// Frequency of a recurring payment, expressed in seconds.
 pub type IntervalSecs = u64;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[contracttype]
 pub enum ScheduleStatus {
@@ -45,7 +47,7 @@ pub enum ScheduleStatus {
     Completed,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct RecurringSchedule {
     pub id: u64,
@@ -76,7 +78,7 @@ pub struct RecurringSchedule {
 
 // ── Events ────────────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct ScheduleAuthorized {
     pub id: u64,
@@ -89,7 +91,7 @@ pub struct ScheduleAuthorized {
     pub max_executions: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct PaymentExecuted {
     pub id: u64,
@@ -99,27 +101,27 @@ pub struct PaymentExecuted {
     pub executions_completed: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct ScheduleCancelled {
     pub id: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct SchedulePaused {
     pub schedule_id: u64,
     pub paused_at: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct ScheduleResumed {
     pub schedule_id: u64,
     pub next_payment_at: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct AmountUpdated {
     pub schedule_id: u64,
@@ -128,7 +130,7 @@ pub struct AmountUpdated {
     pub updated_by: Address,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[contracttype]
 pub struct RecipientUpdated {
     pub schedule_id: u64,
@@ -137,6 +139,10 @@ pub struct RecipientUpdated {
     pub updated_by: Address,
 }
 
+/// Emitted when an execution window (plus grace period) passes without a
+/// successful payment. Also emitted when the caller detects a missed window
+/// by calling `execute_payment` after the grace period has expired.
+#[derive(Debug, Clone)]
 /// Emitted when `execute_payment` finds one or more execution windows whose
 /// grace period expired without a successful payment.
 #[derive(Clone)]
@@ -365,6 +371,13 @@ impl RecurringPaymentsContract {
         amount: i128,
         interval: IntervalSecs,
     ) -> u64 {
+        // Legacy support: default to USDC asset (0-address as placeholder).
+        // Uses contract defaults for grace_period_secs and max_missed_executions.
+        // Strkey of the all-zero contract id.
+        let usdc_placeholder = Address::from_str(
+            &env,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        );
         let token: Address = env
             .storage()
             .persistent()

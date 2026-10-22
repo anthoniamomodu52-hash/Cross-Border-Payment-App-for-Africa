@@ -8,6 +8,7 @@ use soroban_sdk::{
 
 use crate::{
     AdminOverride, AgentEscrowContract, AgentEscrowContractClient, EscrowStatus,
+    EvtEscrowCancelled, EvtEscrowConfirmed, EvtEscrowCreated,
     EvtEscrowCancelled, EvtEscrowConfirmed, EvtEscrowCreated, EvtFeesWithdrawn, InsurancePayout,
     EvtEscrowCancelled, EvtEscrowConfirmed, EvtEscrowCreated, EvtPartialPayoutReleased,
     InsurancePayout,
@@ -18,7 +19,7 @@ use crate::{
 fn setup() -> (Env, AgentEscrowContractClient<'static>, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, AgentEscrowContract);
+    let contract_id = env.register(AgentEscrowContract, ());
     let client = AgentEscrowContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
     let usdc_id = env.register_stellar_asset_contract(admin.clone());
@@ -221,7 +222,7 @@ fn test_confirm_payout_releases_funds_to_agent() {
     let fee_bps = 250u32;
     let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
 
-    client.confirm_payout(&agent, &id);
+    client.confirm_payout(&id);
 
     let expected_fee = (amount * fee_bps as i128) / 10_000;
     let expected_agent = amount - expected_fee;
@@ -238,7 +239,7 @@ fn test_confirm_payout_zero_fee() {
     let amount = 500_0000000i128;
     let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 0);
 
-    client.confirm_payout(&agent, &id);
+    client.confirm_payout(&id);
 
     assert_eq!(TokenClient::new(&env, &usdc_id).balance(&agent), amount);
     assert_eq!(client.get_fees(), 0);
@@ -253,20 +254,21 @@ fn test_confirm_payout_accumulates_fees_across_escrows() {
     let (_, _, agent1, id1) = make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
     let (_, _, agent2, id2) = make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
 
-    client.confirm_payout(&agent1, &id1);
-    client.confirm_payout(&agent2, &id2);
+    client.confirm_payout(&id1);
+    client.confirm_payout(&id2);
 
     let expected_fee = (amount * fee_bps as i128) / 10_000;
     assert_eq!(client.get_fees(), platform_share(expected_fee) * 2);
 }
 
 #[test]
-#[should_panic(expected = "unauthorized: caller is not the escrow agent")]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
 fn test_confirm_payout_wrong_agent_panics() {
     let (env, client, admin, usdc_id) = setup();
     let (_, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, 1_000_0000000, 250);
-    let impostor = Address::generate(&env);
-    client.confirm_payout(&impostor, &id);
+    // Without the escrow agent's signature the payout must be rejected.
+    env.set_auths(&[]);
+    client.confirm_payout(&id);
 }
 
 #[test]
@@ -274,13 +276,15 @@ fn test_confirm_payout_wrong_agent_panics() {
 fn test_confirm_payout_twice_panics() {
     let (env, client, admin, usdc_id) = setup();
     let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, 1_000_0000000, 250);
-    client.confirm_payout(&agent, &id);
-    client.confirm_payout(&agent, &id);
+    client.confirm_payout(&id);
+    client.confirm_payout(&id);
 }
 
 #[test]
 #[should_panic(expected = "escrow not found")]
 fn test_confirm_payout_nonexistent_escrow_panics() {
+    let (_, client, _, _) = setup();
+    client.confirm_payout(&999);
     let (env, client, _, _) = setup();
     let agent = Address::generate(&env);
     client.confirm_payout(&agent, &999);
@@ -297,7 +301,7 @@ fn test_cancel_escrow_after_window_refunds_sender() {
     // Advance past 48-hour window
     env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60 + 1);
 
-    client.cancel_escrow(&sender, &id);
+    client.cancel_escrow(&id);
 
     assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), amount);
     assert_eq!(client.get_escrow(&id).status, EscrowStatus::Cancelled);
@@ -308,7 +312,7 @@ fn test_cancel_escrow_after_window_refunds_sender() {
 fn test_cancel_escrow_before_window_panics() {
     let (env, client, admin, usdc_id) = setup();
     let (sender, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, 500_0000000, 100);
-    client.cancel_escrow(&sender, &id);
+    client.cancel_escrow(&id);
 }
 
 #[test]
@@ -328,6 +332,7 @@ fn test_cancel_escrow_allowed_exactly_at_expiry() {
     let amount = 500_0000000i128;
     let (sender, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 100);
     env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60);
+    client.cancel_escrow(&id);
     client.cancel_escrow(&sender, &id);
     assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), amount);
 }
@@ -339,7 +344,7 @@ fn test_cancel_escrow_wrong_sender_panics() {
     let (_, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, 500_0000000, 100);
     env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60 + 1);
     let impostor = Address::generate(&env);
-    client.cancel_escrow(&impostor, &id);
+    client.cancel_escrow(&id);
 }
 
 #[test]
@@ -347,9 +352,9 @@ fn test_cancel_escrow_wrong_sender_panics() {
 fn test_cancel_escrow_after_completion_panics() {
     let (env, client, admin, usdc_id) = setup();
     let (sender, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, 500_0000000, 100);
-    client.confirm_payout(&agent, &id);
+    client.confirm_payout(&id);
     env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60 + 1);
-    client.cancel_escrow(&sender, &id);
+    client.cancel_escrow(&id);
 }
 
 #[test]
@@ -357,7 +362,7 @@ fn test_cancel_escrow_after_completion_panics() {
 fn test_cancel_escrow_nonexistent_panics() {
     let (env, client, _, _) = setup();
     let sender = Address::generate(&env);
-    client.cancel_escrow(&sender, &999);
+    client.cancel_escrow(&999);
 }
 
 // ── get_escrow ────────────────────────────────────────────────────────────────
@@ -391,6 +396,42 @@ fn test_get_escrow_returns_correct_record() {
 #[test]
 fn test_withdraw_fees_transfers_to_recipient() {
     let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let fee_bps = 500u32;
+    let (_, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
+    client.confirm_payout(&id);
+
+    let total_fee = (amount * fee_bps as i128) / 10_000;
+    let insurance = client.get_insurance_fund();
+    let fees = client.get_fees();
+    assert_eq!(fees + insurance, total_fee);
+
+    client.withdraw_fees(&admin);
+
+    assert_eq!(client.get_fees(), 0);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&admin), fees);
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_withdraw_fees_non_admin_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let (_, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, 1_000_0000000, 500);
+    client.confirm_payout(&id);
+    let impostor = Address::generate(&env);
+    // Without the admin's signature the withdrawal must be rejected.
+    env.set_auths(&[]);
+    client.withdraw_fees(&impostor);
+}
+
+#[test]
+#[should_panic(expected = "no fees to withdraw")]
+fn test_withdraw_fees_twice_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let (_, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, 1_000_0000000, 500);
+    client.confirm_payout(&id);
+    client.withdraw_fees(&admin);
+    client.withdraw_fees(&admin);
     let (_, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, 1_000_0000000, 500);
     client.confirm_payout(&id);
 
@@ -579,7 +620,7 @@ fn test_admin_release_refunds_sender_on_pending_escrow() {
 fn test_admin_release_on_completed_escrow_panics() {
     let (env, client, admin, usdc_id) = setup();
     let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, 1_000_0000000, 250);
-    client.confirm_payout(&agent, &id);
+    client.confirm_payout(&id);
     client.admin_release(&id, &true, &Symbol::new(&env, "DisputeResolved"));
 }
 
@@ -589,7 +630,7 @@ fn test_admin_release_on_cancelled_escrow_panics() {
     let (env, client, admin, usdc_id) = setup();
     let (sender, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, 1_000_0000000, 250);
     env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60 + 1);
-    client.cancel_escrow(&sender, &id);
+    client.cancel_escrow(&id);
     client.admin_release(&id, &false, &Symbol::new(&env, "FraudConfirmed"));
 }
 
@@ -603,6 +644,17 @@ fn test_admin_release_includes_reason_in_event() {
     client.admin_release(&id, &true, &reason);
 
     // Verify reason is included in the AdminOverride event
+    let contract_topic: Val = Symbol::new(&env, "AgentEscrow").into_val(&env);
+    let event_topic: Val = Symbol::new(&env, "AdminOverride").into_val(&env);
+    let events = all_events(&env);
+    let ao_event = events.iter().find(|(_, topics, _)| {
+        topics.len() == 2
+            && topics.get(0).map(|t| val_eq(&env, &t, &contract_topic)).unwrap_or(false)
+            && topics.get(1).map(|t| val_eq(&env, &t, &event_topic)).unwrap_or(false)
+    });
+    assert!(ao_event.is_some(), "AdminOverride event not emitted");
+    let (_, _, data) = ao_event.unwrap();
+    let payload: AdminOverride = soroban_sdk::FromVal::from_val(&env, &data);
     let events = env.events().all();
     let ao_event = find_event(&env, &events, "AdminOverride");
     assert!(ao_event.is_some(), "AdminOverride event not emitted");
@@ -624,6 +676,17 @@ fn test_admin_release_emits_admin_override_event() {
     client.admin_release(&id, &true, &Symbol::new(&env, "DisputeResolved"));
 
     // Two-element topic: ("AgentEscrow", "AdminOverride")
+    let contract_topic: Val = Symbol::new(&env, "AgentEscrow").into_val(&env);
+    let event_topic: Val = Symbol::new(&env, "AdminOverride").into_val(&env);
+    let events = all_events(&env);
+    let ao_event = events.iter().find(|(_, topics, _)| {
+        topics.len() == 2
+            && topics.get(0).map(|t| val_eq(&env, &t, &contract_topic)).unwrap_or(false)
+            && topics.get(1).map(|t| val_eq(&env, &t, &event_topic)).unwrap_or(false)
+    });
+    assert!(ao_event.is_some(), "AdminOverride event not emitted");
+    let (_, _, data) = ao_event.unwrap();
+    let payload: AdminOverride = soroban_sdk::FromVal::from_val(&env, &data);
     let events = env.events().all();
     let ao_event = find_event(&env, &events, "AdminOverride");
     assert!(ao_event.is_some(), "AdminOverride event not emitted");
@@ -645,6 +708,8 @@ fn find_event<'a>(
 ) -> Option<(soroban_sdk::Address, soroban_sdk::Vec<Val>, Val)> {
     events.iter().find(|(_, topics, _)| {
         topics.len() >= 2
+            && topics.get(0).map(|t| val_eq(&env, &t, &contract_topic)).unwrap_or(false)
+            && topics.get(1).map(|t| val_eq(&env, &t, &name_topic)).unwrap_or(false)
             && topics.get(0).map(|t| topic_is(env, &t, "AgentEscrow")).unwrap_or(false)
             && topics.get(1).map(|t| topic_is(env, &t, event_name)).unwrap_or(false)
     })
@@ -657,11 +722,12 @@ fn test_create_escrow_emits_escrow_created_event() {
     let (sender, recipient, agent, id) =
         make_escrow(&env, &client, &usdc_id, &admin, amount, 250);
 
-    let all = env.events().all();
+    let all = all_events(&env);
     let event = find_event(&env, &all, "EscrowCreated");
     assert!(event.is_some(), "EscrowCreated event not emitted");
 
     let (_, _, data) = event.unwrap();
+    let payload: EvtEscrowCreated = soroban_sdk::FromVal::from_val(&env, &data);
     let payload = EvtEscrowCreated::from_val(&env, &data);
     assert_eq!(payload.escrow_id, id);
     assert_eq!(payload.sender, sender);
@@ -677,6 +743,12 @@ fn test_create_escrow_emits_escrow_created_event() {
 fn test_confirm_payout_emits_escrow_confirmed_event() {
     let (env, client, admin, usdc_id) = setup();
     let amount = 1_000_0000000i128;
+    let (sender, recipient, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 500);
+
+    client.confirm_payout(&id);
+
+    let all = all_events(&env);
+    assert!(find_event(&env, &all, "EscrowConfirmed").is_some());
     let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 500);
 
     client.confirm_payout(&agent, &id);
@@ -938,7 +1010,7 @@ fn test_partial_confirm_payout_single_release() {
     let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
 
     let partial = 400_0000000i128;
-    client.partial_confirm_payout(&agent, &id, &partial);
+    client.partial_confirm_payout(&id, &partial);
 
     let expected_fee = (partial * fee_bps as i128) / 10_000;
     let expected_net = partial - expected_fee;
@@ -964,9 +1036,9 @@ fn test_partial_confirm_payout_multiple_releases_complete_escrow() {
     let second = 300_0000000i128;
     let third = 400_0000000i128; // first + second + third == amount
 
-    client.partial_confirm_payout(&agent, &id, &first);
-    client.partial_confirm_payout(&agent, &id, &second);
-    client.partial_confirm_payout(&agent, &id, &third);
+    client.partial_confirm_payout(&id, &first);
+    client.partial_confirm_payout(&id, &second);
+    client.partial_confirm_payout(&id, &third);
 
     let fee1 = (first * fee_bps as i128) / 10_000;
     let fee2 = (second * fee_bps as i128) / 10_000;
@@ -991,7 +1063,7 @@ fn test_partial_confirm_payout_over_release_panics() {
     let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 250);
 
     // Try to release more than the escrow amount.
-    client.partial_confirm_payout(&agent, &id, &(amount + 1));
+    client.partial_confirm_payout(&id, &(amount + 1));
 }
 
 #[test]
@@ -1001,9 +1073,9 @@ fn test_partial_confirm_payout_over_remaining_after_first_release_panics() {
     let amount = 1_000_0000000i128;
     let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 250);
 
-    client.partial_confirm_payout(&agent, &id, &600_0000000);
+    client.partial_confirm_payout(&id, &600_0000000);
     // Remaining is 400; trying to release 401 should panic.
-    client.partial_confirm_payout(&agent, &id, &400_0000001);
+    client.partial_confirm_payout(&id, &400_0000001);
 }
 
 #[test]
@@ -1015,7 +1087,7 @@ fn test_partial_confirm_payout_after_expiry_panics() {
     // Advance time past expires_at (48 h window).
     env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60);
 
-    client.partial_confirm_payout(&agent, &id, &100_0000000);
+    client.partial_confirm_payout(&id, &100_0000000);
 }
 
 #[test]
@@ -1024,17 +1096,18 @@ fn test_partial_confirm_payout_on_completed_escrow_panics() {
     let (env, client, admin, usdc_id) = setup();
     let amount = 500_0000000i128;
     let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 250);
-    client.confirm_payout(&agent, &id);
-    client.partial_confirm_payout(&agent, &id, &100_0000000);
+    client.confirm_payout(&id);
+    client.partial_confirm_payout(&id, &100_0000000);
 }
 
 #[test]
-#[should_panic(expected = "unauthorized: caller is not the escrow agent")]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
 fn test_partial_confirm_payout_wrong_agent_panics() {
     let (env, client, admin, usdc_id) = setup();
     let (_, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, 500_0000000, 250);
-    let impostor = Address::generate(&env);
-    client.partial_confirm_payout(&impostor, &id, &100_0000000);
+    // Without the escrow agent's signature the payout must be rejected.
+    env.set_auths(&[]);
+    client.partial_confirm_payout(&id, &100_0000000);
 }
 
 #[test]
@@ -1044,13 +1117,14 @@ fn test_confirm_payout_emits_escrow_confirmed_payload() {
     let fee_bps = 250u32;
     let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
 
-    client.confirm_payout(&agent, &id);
+    client.confirm_payout(&id);
 
-    let all = env.events().all();
+    let all = all_events(&env);
     let event = find_event(&env, &all, "EscrowConfirmed");
     assert!(event.is_some(), "EscrowConfirmed event not emitted");
 
     let (_, _, data) = event.unwrap();
+    let payload: EvtEscrowConfirmed = soroban_sdk::FromVal::from_val(&env, &data);
     let payload = EvtEscrowConfirmed::from_val(&env, &data);
     let expected_fee = (amount * fee_bps as i128) / 10_000;
     let expected_agent = amount - expected_fee;
@@ -1067,13 +1141,14 @@ fn test_cancel_escrow_emits_escrow_cancelled_event() {
     let (sender, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 200);
 
     env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60 + 1);
-    client.cancel_escrow(&sender, &id);
+    client.cancel_escrow(&id);
 
-    let all = env.events().all();
+    let all = all_events(&env);
     let event = find_event(&env, &all, "EscrowCancelled");
     assert!(event.is_some(), "EscrowCancelled event not emitted");
 
     let (_, _, data) = event.unwrap();
+    let payload: EvtEscrowCancelled = soroban_sdk::FromVal::from_val(&env, &data);
     let payload = EvtEscrowCancelled::from_val(&env, &data);
     assert_eq!(payload.escrow_id, id);
     assert_eq!(payload.sender, sender);
@@ -1081,6 +1156,7 @@ fn test_cancel_escrow_emits_escrow_cancelled_event() {
 }
 
 #[test]
+fn test_partial_confirm_payout_emits_partial_payout_event() {
 fn test_partial_confirm_payout_emits_event() {
     let (env, client, admin, usdc_id) = setup();
     let amount = 1_000_0000000i128;
@@ -1088,8 +1164,12 @@ fn test_partial_confirm_payout_emits_event() {
     let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
 
     let partial = 400_0000000i128;
-    client.partial_confirm_payout(&agent, &id, &partial);
+    client.partial_confirm_payout(&id, &partial);
 
+    let event_name: Val = Symbol::new(&env, "PartialPayoutReleased").into_val(&env);
+    let events = all_events(&env);
+    let evt = events.iter().find(|(_, topics, _)| {
+        topics.iter().any(|t| val_eq(&env, &t, &event_name))
     let events = env.events().all();
     let evt = events.iter().find(|(_, topics, _)| {
         topics.iter().any(|t| topic_is(&env, &t, "PartialPayoutReleased"))
@@ -1097,6 +1177,7 @@ fn test_partial_confirm_payout_emits_event() {
     assert!(evt.is_some(), "PartialPayoutReleased event not emitted");
 
     let (_, _, data) = evt.unwrap();
+    let payload: crate::EvtPartialPayoutReleased = soroban_sdk::FromVal::from_val(&env, &data);
     let payload = EvtPartialPayoutReleased::from_val(&env, &data);
     assert_eq!(payload.escrow_id, id);
     assert_eq!(payload.agent, agent);
@@ -1114,7 +1195,7 @@ fn test_partial_confirm_payout_zero_fee() {
     let amount = 800_0000000i128;
     let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 0);
 
-    client.partial_confirm_payout(&agent, &id, &500_0000000);
+    client.partial_confirm_payout(&id, &500_0000000);
 
     // No fee deducted; agent receives full partial amount.
     assert_eq!(TokenClient::new(&env, &usdc_id).balance(&agent), 500_0000000);
@@ -1129,13 +1210,49 @@ fn test_partial_confirm_payout_released_amount_tracks_cumulative_gross() {
     let fee_bps = 100u32;
     let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
 
-    client.partial_confirm_payout(&agent, &id, &200_0000000);
+    client.partial_confirm_payout(&id, &200_0000000);
     assert_eq!(client.get_escrow(&id).released_amount, 200_0000000);
 
-    client.partial_confirm_payout(&agent, &id, &200_0000000);
+    client.partial_confirm_payout(&id, &200_0000000);
     assert_eq!(client.get_escrow(&id).released_amount, 400_0000000);
 }
 
+/// Events emitted so far, as `(contract, topics, data)` tuples.
+///
+/// soroban-sdk 23+ returns events in XDR form; this converts them back to
+/// host values so tests can decode payloads with `FromVal`.
+#[allow(dead_code)]
+fn all_events(
+    env: &soroban_sdk::Env,
+) -> soroban_sdk::Vec<(
+    soroban_sdk::Address,
+    soroban_sdk::Vec<soroban_sdk::Val>,
+    soroban_sdk::Val,
+)> {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{xdr, Address, TryFromVal, Val, Vec};
+    let mut out = Vec::new(env);
+    for e in env.events().all().events() {
+        let xdr::ContractEventBody::V0(body) = &e.body;
+        let Some(contract_id) = e.contract_id.clone() else {
+            continue;
+        };
+        let contract =
+            Address::try_from_val(env, &xdr::ScAddress::Contract(contract_id)).unwrap();
+        let mut topics: Vec<Val> = Vec::new(env);
+        for t in body.topics.iter() {
+            topics.push_back(Val::try_from_val(env, t).unwrap());
+        }
+        out.push_back((contract, topics, Val::try_from_val(env, &body.data).unwrap()));
+    }
+    out
+}
+
+/// Compares two host values structurally (`Val` has no `PartialEq`).
+#[allow(dead_code)]
+fn val_eq(env: &soroban_sdk::Env, a: &soroban_sdk::Val, b: &soroban_sdk::Val) -> bool {
+    use soroban_sdk::{xdr::ScVal, TryFromVal};
+    ScVal::try_from_val(env, a).ok() == ScVal::try_from_val(env, b).ok()
 // ── Removed agents cannot claim; admin reassignment ──────────────────────────
 
 #[test]
