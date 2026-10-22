@@ -14,6 +14,7 @@
 const { v4: uuidv4 } = require("uuid");
 const db = require("../db");
 const { createEscrow, confirmPayout, cancelEscrow } = require("../services/agentEscrow");
+const { sendAgentEscrowDeliveredEmail } = require("../services/email");
 const { enqueueEmail, sendEscrowCancelledEmail } = require("../services/email");
 const audit = require("../services/audit");
 const logger = require("../utils/logger");
@@ -282,11 +283,7 @@ async function confirm(req, res, next) {
     );
     if (senderResult.rows[0]) {
       const { email, full_name, agent_name } = senderResult.rows[0];
-      enqueueEmail({
-        to: email,
-        subject: "Your AfriPay payment has been delivered",
-        html: `<p>Hi ${full_name},</p><p>Your payment of <strong>${escrow.amount} ${escrow.asset}</strong> has been delivered to ${escrow.recipient_wallet} by agent <strong>${agent_name || escrow.agent_wallet}</strong>.</p>`,
-      }).catch(() => {});
+      sendAgentEscrowDeliveredEmail(email, full_name, escrow.amount, escrow.asset, escrow.recipient_wallet, agent_name || escrow.agent_wallet).catch(() => {});
     }
 
     await audit.log(

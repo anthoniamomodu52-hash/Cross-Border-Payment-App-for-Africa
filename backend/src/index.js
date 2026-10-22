@@ -112,6 +112,9 @@ io.use(async (socket, next) => {
 });
 
 io.on('connection', async (socket) => {
+  // User-scoped room: user-level events (e.g. notification:new) are emitted
+  // here once, instead of once per wallet room (which duplicated them).
+  socket.join(`user:${socket.userId}`);
   socket.join(socketRegistry.userRoom(socket.userId));
   // Force reconnect with a fresh token once the access token expires (#1302)
   const expiryTimer = socket.data.exp

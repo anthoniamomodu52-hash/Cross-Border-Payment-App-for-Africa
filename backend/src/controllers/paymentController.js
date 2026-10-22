@@ -17,7 +17,7 @@ const {
 } = require("../services/stellar");
 const webhook = require("../services/webhook");
 const cache = require("../utils/cache");
-const { sendTransactionEmail, enqueueEmail } = require("../services/email");
+const { sendTransactionEmail, sendEscrowCancelledEmail } = require("../services/email");
 const { persistAndBroadcast } = require("../services/notificationInbox");
 const { checkVelocity, checkDailyLimit, checkFraud, logFraudBlock } = require("../services/fraudDetection");
 const { withLock } = require("../utils/distributedLock");
@@ -1310,6 +1310,121 @@ async function getPaymentById(req, res, next) {
  *  - Event is written to the audit log.
  */
 async function cancelPendingEscrow(req, res, next) {
+  try {
+    const { id } = req.params;
+
+    // 1. Load the escrow record from agent_escrows
+    const escrowResult = await db.query(
+      "SELECT * FROM agent_escrows WHERE id = $1",
+      [id]
+    );
+    if (!escrowResult.rows[0]) {
+      return res.status(404).json({ error: "Escrow not found" });
+    }
+    const escrow = escrowResult.rows[0];
+
+    // 2. Validate status
+    if (escrow.status !== "pending") {
+      return res.status(400).json({ error: "Only pending escrows can be cancelled" });
+    }
+
+    // 3. Verify the caller is the sender
+    const walletResult = await db.query(
+      "SELECT public_key, encrypted_secret_key FROM wallets WHERE user_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1",
+      [req.user.userId]
+    );
+    if (!walletResult.rows[0]) {
+      return res.status(404).json({ error: "Wallet not found" });
+    }
+    const { public_key, encrypted_secret_key } = walletResult.rows[0];
+
+    if (escrow.sender_wallet !== public_key) {
+      return res.status(403).json({ error: "Only the sender can cancel this escrow" });
+    }
+
+    // 4. Enforce 48-hour cancellation window: expires_at must be in the past
+    //    If expires_at is null, fall back to created_at + 48h
+    const expiresAt = escrow.expires_at
+      ? new Date(escrow.expires_at)
+      : new Date(new Date(escrow.created_at).getTime() + 48 * 60 * 60 * 1000);
+
+    const now = new Date();
+    if (now < expiresAt) {
+      return res.status(403).json({
+        error: "CANCEL_TOO_EARLY",
+        message: "You cannot cancel this payment until 48 hours after creation.",
+        cancel_available_at: expiresAt.toISOString(),
+      });
+    }
+
+    // 5. Call Soroban cancel_escrow on-chain — DB is NOT updated if this fails
+    let cancelTxHash;
+    try {
+      ({ txHash: cancelTxHash } = await cancelEscrow({
+        encryptedSecretKey: encrypted_secret_key,
+        escrowId: escrow.contract_escrow_id,
+      }));
+    } catch (stellarErr) {
+      logger.error("On-chain cancel_escrow failed", {
+        escrowId: escrow.contract_escrow_id,
+        error: stellarErr.message,
+      });
+      return res.status(502).json({
+        error: "On-chain cancellation failed. DB record has NOT been updated.",
+        detail: stellarErr.message,
+      });
+    }
+
+    // 6. On-chain confirmed — now update the database record
+    await db.query(
+      "UPDATE agent_escrows SET status = 'cancelled', cancelled_at = NOW(), confirm_tx_hash = $1 WHERE id = $2",
+      [cancelTxHash, id]
+    );
+
+    // 7. Notify sender via email (fire-and-forget)
+    db.query(
+      "SELECT u.email, u.full_name FROM users u JOIN wallets w ON w.user_id = u.id WHERE w.public_key = $1 LIMIT 1",
+      [escrow.sender_wallet]
+    )
+      .then(({ rows }) => {
+        if (!rows[0]) return;
+        const { email, full_name } = rows[0];
+        sendEscrowCancelledEmail(email, full_name, escrow.amount, escrow.asset, cancelTxHash).catch(() => {});
+      })
+      .catch(() => {});
+
+    // 8. Write cancellation event to audit log
+    await audit.auditLog(req, "escrow_cancelled", {
+      type: "agent_escrow",
+      id,
+      newValue: {
+        escrow_id: id,
+        contract_escrow_id: escrow.contract_escrow_id,
+        stellar_tx_hash: cancelTxHash,
+        cancelled_at: new Date().toISOString(),
+      },
+    });
+
+    // 9. Fire webhook event (non-blocking)
+    webhook.deliver("escrow.cancelled", req.user.userId, {
+      escrow_id: id,
+      contract_escrow_id: escrow.contract_escrow_id,
+      tx_hash: cancelTxHash,
+      amount: escrow.amount,
+      asset: escrow.asset,
+      sender: escrow.sender_wallet,
+    }).catch(() => {});
+
+    return res.json({
+      message: "Escrow cancelled and funds refunded to your wallet",
+      escrow_id: id,
+      contract_escrow_id: escrow.contract_escrow_id,
+      tx_hash: cancelTxHash,
+      status: "cancelled",
+    });
+  } catch (err) {
+    next(err);
+  }
   // BE-179: single canonical implementation lives in agentEscrowController.
   // Required lazily to avoid a circular import.
   return require("./agentEscrowController").cancel(req, res, next);
