@@ -133,17 +133,29 @@ pub struct RecipientUpdated {
     pub updated_by: Address,
 }
 
-/// Emitted when an execution window (plus grace period) passes without a
-/// successful payment. Also emitted when the caller detects a missed window
-/// by calling `execute_payment` after the grace period has expired.
+/// Emitted when `execute_payment` finds one or more execution windows whose
+/// grace period expired without a successful payment.
 #[derive(Clone)]
 #[contracttype]
 pub struct PaymentMissed {
     pub schedule_id: u64,
     /// Ledger timestamp at which the miss was recorded.
     pub missed_at: u64,
+    /// Number of windows found missed by this call (can be > 1 when nobody
+    /// executed the schedule for several intervals).
+    pub newly_missed: u64,
     /// Total consecutive misses recorded for this schedule after this event.
     pub total_missed: u64,
+}
+
+/// Emitted when a schedule is cancelled automatically because it reached
+/// `max_missed_executions` consecutive missed windows.
+#[derive(Clone)]
+#[contracttype]
+pub struct ScheduleAutoCancelled {
+    pub schedule_id: u64,
+    pub total_missed: u64,
+    pub cancelled_at: u64,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -336,22 +348,18 @@ impl RecurringPaymentsContract {
         )
     }
 
-    /// Execute a due payment for `schedule_id`.
-    /// Anyone may call this (permissionless / incentivized execution).
+    /// Execute a due payment for `schedule_id`. Anyone may call this.
     ///
-    /// Timing rules and Missed-execution Accounting:
-    /// - `now < next_payment_at`                          → panics "payment not yet due"
-    /// - `now` in `[next_payment_at, next_payment_at + grace_period_secs]`
-    ///                                                    → payment executed normally and resets `consecutive_misses` to 0
-    /// - `now > next_payment_at + grace_period_secs`      → miss recorded, `consecutive_misses` incremented by 1,
-    ///   `PaymentMissed` emitted, schedule state persisted, and function returns early.
-    ///
-    /// Consecutive Miss Threshold & Auto-Cancellation:
-    /// - When `consecutive_misses >= max_missed_executions`, the schedule is automatically cancelled
-    ///   (`status` set to `ScheduleStatus::Cancelled`).
-    /// - If `consecutive_misses < max_missed_executions`, the schedule's `next_payment_at` is skipped
-    ///   forward across elapsed intervals to prevent a deadlock, remaining `Active` until the next window.
-    /// - A subsequent successful execution before reaching `max_missed_executions` resets the consecutive miss counter to 0.
+    /// - `now < next_payment_at` → panics "payment not yet due".
+    /// - `now <= next_payment_at + grace_period_secs` → payment executes and
+    ///   `consecutive_misses` resets to 0.
+    /// - Otherwise every window whose grace period has expired counts as a
+    ///   miss (one per interval, not one per call). `next_payment_at` moves to
+    ///   the first window that has not expired, `PaymentMissed` is emitted and
+    ///   the call returns without paying. If the open window is already due,
+    ///   a second call executes it.
+    /// - When `consecutive_misses >= max_missed_executions` the schedule is
+    ///   cancelled and `ScheduleAutoCancelled` is emitted.
     pub fn execute_payment(env: Env, executor: Address, schedule_id: u64) {
         executor.require_auth();
 
@@ -377,19 +385,22 @@ impl RecurringPaymentsContract {
         // ── Grace period check ────────────────────────────────────────────────
         let grace_deadline = schedule.next_payment_at + schedule.grace_period_secs;
         if now > grace_deadline {
-            // The execution window AND grace period have both passed.
-            // Record the miss, emit the event, and potentially auto-cancel.
-            schedule.consecutive_misses += 1;
-            let total_missed = schedule.consecutive_misses;
+            // Count every window whose grace period has expired: window k is
+            // due at next_payment_at + k * interval and expired if its
+            // deadline (due + grace) is before `now`. Window 0 is known to
+            // have expired, so newly_missed >= 1.
+            let newly_missed = (now - grace_deadline - 1) / schedule.interval + 1;
+            let total_missed = schedule.consecutive_misses.saturating_add(newly_missed);
+            schedule.consecutive_misses = total_missed;
 
-            // Advance next_payment_at so the schedule does not get permanently stuck.
-            // Skip forward by enough intervals to land in the future.
-            let elapsed = now - schedule.next_payment_at;
-            let intervals_missed = elapsed / schedule.interval + 1;
-            schedule.next_payment_at += intervals_missed * schedule.interval;
+            // Move to the first window that has not expired yet.
+            schedule.next_payment_at = newly_missed
+                .checked_mul(schedule.interval)
+                .and_then(|skip| schedule.next_payment_at.checked_add(skip))
+                .expect("next_payment_at overflow");
 
-            // Auto-cancel if the consecutive miss threshold is reached.
-            if total_missed >= schedule.max_missed_executions {
+            let auto_cancelled = total_missed >= schedule.max_missed_executions;
+            if auto_cancelled {
                 schedule.status = ScheduleStatus::Cancelled;
             }
 
@@ -406,9 +417,21 @@ impl RecurringPaymentsContract {
                 PaymentMissed {
                     schedule_id,
                     missed_at: now,
+                    newly_missed,
                     total_missed,
                 },
             );
+
+            if auto_cancelled {
+                env.events().publish(
+                    (Symbol::new(&env, "ScheduleAutoCancelled"),),
+                    ScheduleAutoCancelled {
+                        schedule_id,
+                        total_missed,
+                        cancelled_at: now,
+                    },
+                );
+            }
 
             return;
         }

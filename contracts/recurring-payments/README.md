@@ -30,6 +30,21 @@ authorize_recurring → Active
                                   Cancelled
 ```
 
+## Missed payments
+
+Each window opens at `next_payment_at` and stays open for `grace_period_secs`.
+When `execute_payment` is called after a window's grace period has expired:
+
+- **Every** expired window counts as a miss — a schedule left idle for six
+  months records ~180 daily misses in one call, not one.
+- `next_payment_at` moves to the first window that has not expired; no payment
+  is made in that call.
+- `PaymentMissed { schedule_id, missed_at, newly_missed, total_missed }` is emitted.
+- If `total_missed >= max_missed_executions` the schedule becomes `Cancelled`
+  and `ScheduleAutoCancelled { schedule_id, total_missed, cancelled_at }` is emitted.
+
+A successful payment resets the consecutive-miss counter to 0.
+
 ## Prerequisites
 
 - Rust with `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
