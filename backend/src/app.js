@@ -109,6 +109,14 @@ app.use('/api/admin', rateLimiters.adminLimiter);
 app.use('/api', rateLimiters.readLimiter);
 
 app.use('/api/auth', authRoutes);
+// Deprecated alias for /api/contacts (BE-188) — same router and middleware stack.
+const CONTACTS_SUNSET = 'Wed, 31 Mar 2027 00:00:00 GMT';
+app.use('/api/wallet/contacts', (req, res, next) => {
+  res.set('Deprecation', 'true');
+  res.set('Sunset', CONTACTS_SUNSET);
+  res.set('Link', '</api/contacts>; rel="successor-version"');
+  next();
+}, contactsRoutes);
 app.use('/api/wallet', walletRoutes);
 app.use('/api/payments', geoRestriction, paymentRoutes);
 app.use('/api/payment-requests', geoRestriction, paymentRequestRoutes);

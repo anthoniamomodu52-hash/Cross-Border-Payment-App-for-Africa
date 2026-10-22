@@ -718,6 +718,16 @@ async function sendBatch(req, res, next) {
   }
 }
 
+const HISTORY_STATUSES = ["pending", "confirming", "completed", "failed", "pending_claim", "cancelled"];
+
+// Parse a comma-separated status filter; returns null when absent, false when invalid.
+function parseStatusFilter(raw) {
+  if (raw == null || String(raw).trim() === "") return null;
+  const values = [...new Set(String(raw).split(",").map((v) => v.trim()).filter(Boolean))];
+  if (!values.length || values.some((v) => !HISTORY_STATUSES.includes(v))) return false;
+  return values;
+}
+
 async function history(req, res, next) {
   try {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
@@ -747,6 +757,11 @@ async function history(req, res, next) {
     if (req.query.asset != null && String(req.query.asset).trim() !== "") {
       assetFilter = normalizeAsset(req.query.asset);
       if (!assetFilter) return res.status(400).json({ error: "Invalid asset filter" });
+    }
+
+    const statusFilter = parseStatusFilter(req.query.status);
+    if (statusFilter === false) {
+      return res.status(400).json({ error: `Invalid status value. Must be one of: ${HISTORY_STATUSES.join(", ")}` });
     }
 
     const walletResult = await db.query(
@@ -785,6 +800,10 @@ async function history(req, res, next) {
     if (assetFilter) {
       conditions.push(`asset = $${baseParams.length + 1}`);
       baseParams.push(assetFilter);
+    }
+    if (statusFilter) {
+      conditions.push(`status = ANY($${baseParams.length + 1})`);
+      baseParams.push(statusFilter);
     }
     const whereClause = conditions.join(" AND ");
 
@@ -1073,9 +1092,9 @@ async function exportCSV(req, res, next) {
 
     const { public_key } = walletResult.rows[0];
 
-    const ALLOWED_STATUSES = ["pending", "completed", "cancelled", "failed"];
-    if (req.query.status && !ALLOWED_STATUSES.includes(req.query.status)) {
-      return res.status(400).json({ error: `Invalid status value. Must be one of: ${ALLOWED_STATUSES.join(", ")}` });
+    const statusFilter = parseStatusFilter(req.query.status);
+    if (statusFilter === false) {
+      return res.status(400).json({ error: `Invalid status value. Must be one of: ${HISTORY_STATUSES.join(", ")}` });
     }
 
     const sanitize = (s) => s.replace(/[^0-9a-zA-Z_\-]/g, "");
@@ -1105,7 +1124,7 @@ async function exportCSV(req, res, next) {
     let filters = "";
     if (req.query.from)      { params.push(req.query.from);   filters += ` AND created_at >= $${params.length}`; }
     if (req.query.to)        { params.push(req.query.to);     filters += ` AND created_at <= $${params.length}`; }
-    if (req.query.status)    { params.push(req.query.status); filters += ` AND status = $${params.length}`; }
+    if (statusFilter)        { params.push(statusFilter);     filters += ` AND status = ANY($${params.length})`; }
     if (req.query.direction === "sent")     filters += " AND sender_wallet = $1";
     else if (req.query.direction === "received") filters += " AND recipient_wallet = $1";
 

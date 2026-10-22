@@ -269,7 +269,7 @@ export default function SendMoney() {
 
   useEffect(() => {
     api
-      .get('/wallet/contacts')
+      .get('/contacts')
       .then((r) => setContacts(r.data.contacts || []))
       .catch(() => {});
   }, []);
@@ -1690,7 +1690,7 @@ export default function SendMoney() {
                   if (!saveContactName.trim()) return;
                   setSaveContactLoading(true);
                   try {
-                    await api.post('/wallet/contacts', { name: saveContactName.trim(), wallet_address: showSaveContactPrompt });
+                    await api.post('/contacts', { name: saveContactName.trim(), wallet_address: showSaveContactPrompt });
                     toast.success('Contact saved!');
                   } catch {
                     toast.error('Could not save contact');

@@ -319,7 +319,7 @@ export default function Profile() {
   React.useEffect(() => {
     const fetchContacts = async () => {
       try {
-        const res = await api.get('/wallet/contacts');
+        const res = await api.get('/contacts');
         setContacts(res.data.contacts || []);
       } catch {
         toast.error('Failed to load contacts');
@@ -422,7 +422,7 @@ export default function Profile() {
         .split(',')
         .map((t) => t.trim())
         .filter(Boolean);
-      const res = await api.post('/wallet/contacts', { ...newContact, tags });
+      const res = await api.post('/contacts', { ...newContact, tags });
       setContacts([...contacts, res.data.contact]);
       setNewContact({
         name: '',
@@ -443,7 +443,7 @@ export default function Profile() {
     const { id } = deleteContactPending;
     setDeleteContactPending(null);
     try {
-      await api.delete(`/wallet/contacts/${id}`);
+      await api.delete(`/contacts/${id}`);
       setContacts(contacts.filter((c) => c.id !== id));
       toast.success('Contact deleted');
     } catch {

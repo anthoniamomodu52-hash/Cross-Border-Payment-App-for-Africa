@@ -177,6 +177,11 @@ router.get(
  *           type: string
  *           enum: [XLM, USDC, NGN, GHS, KES]
  *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *         description: Comma-separated status filter (pending, confirming, completed, failed, pending_claim, cancelled). Unknown values return 400.
+ *       - in: query
  *         name: limit
  *         schema:
  *           type: integer

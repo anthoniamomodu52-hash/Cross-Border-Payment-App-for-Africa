@@ -15,6 +15,7 @@ const db = require("../db");
 const { createEscrow, confirmPayout, cancelEscrow } = require("../services/agentEscrow");
 const { enqueueEmail } = require("../services/email");
 const audit = require("../services/audit");
+const feeConfigService = require("../services/feeConfigService");
 
 const DEFAULT_FEE_BPS = parseInt(process.env.ESCROW_FEE_BPS || "250", 10);
 
@@ -45,12 +46,16 @@ async function create(req, res, next) {
     }
     const { public_key, encrypted_secret_key } = walletResult.rows[0];
 
+    // The fee is server-authoritative: any client-supplied fee_bps is ignored.
+    const feeConfig = await feeConfigService.getActiveConfig("escrow", "USDC");
+    const feeBps = feeConfig ? Number(feeConfig.fee_bps) : DEFAULT_FEE_BPS;
+
     const { escrowId, txHash } = await createEscrow({
       encryptedSecretKey: encrypted_secret_key,
       recipient: recipient_wallet,
       agent: agent_wallet,
       amount: Math.round(parseFloat(amount) * 1e7), // convert to stroops
-      feeBps: DEFAULT_FEE_BPS,
+      feeBps,
     });
 
     await db.query(
@@ -66,14 +71,14 @@ async function create(req, res, next) {
         agent_wallet,
         amount,
         asset,
-        DEFAULT_FEE_BPS,
+        feeBps,
         txHash,
       ]
     );
 
     res.status(201).json({
       message: "Escrow created",
-      escrow: { id: escrowDbId, contract_escrow_id: escrowId, tx_hash: txHash, status: "pending" },
+      escrow: { id: escrowDbId, contract_escrow_id: escrowId, tx_hash: txHash, fee_bps: feeBps, status: "pending" },
     });
   } catch (err) {
     next(err);
