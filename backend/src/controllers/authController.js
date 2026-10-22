@@ -427,7 +427,7 @@ async function login(req, res, next) {
     );
 
     // Record session for remote logout support
-    await recordSession(user.id, token, req).catch(() => {});
+    await recordSession(user.id, token, req, familyId).catch(() => {});
 
     const device_token = rememberDevice ? signDeviceToken({ userId: user.id }) : undefined;
 
