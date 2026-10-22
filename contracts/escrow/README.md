@@ -834,8 +834,8 @@ soroban contract deploy \
 - `cancel_escrow`: `sender.require_auth()` + sender address match.
 - `withdraw_fees`: `admin.require_auth()` + stored admin match.
 - `dispute_escrow`: `require_auth()` + caller must be the escrow sender or recipient.
-- `upgrade`, `migrate`, `set_retention_period`, `cleanup_escrow`, `update_fee`, `set_kyc_contract`, `set_dispute_contract`: admin-only.
-- `upgrade`, `migrate`, `set_retention_period`, `update_fee`, `set_kyc_contract`: admin-only.
+- `upgrade`, `migrate`, `set_retention_period`, `cleanup_escrow`, `update_fee`, `set_kyc_contract`, `clear_kyc_contract`, `set_dispute_contract`: admin-only.
+- `upgrade`, `migrate`, `set_retention_period`, `update_fee`, `set_kyc_contract`, `clear_kyc_contract`: admin-only.
 - `expire_escrow`, `cleanup_escrow`: permissionless (anyone may call once eligible).
 
 ### Event Emission Completeness

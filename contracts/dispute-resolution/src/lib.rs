@@ -43,6 +43,7 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, token, Address, Bytes, Env, IntoVal, Symbol, Vec,
 };
 
+#[cfg(test)]
 mod test;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -477,6 +478,13 @@ impl DisputeResolutionContract {
     /// * `sender`, `recipient`, `agent` — Escrow parties.
     /// * `amount`           — USDC (stroops) already transferred.
     /// * `payout_confirmed` — Whether the agent had called `confirm_delivery`.
+    /// * `escrow_contract` — The calling escrow contract. Must match the
+    ///                       registered escrow contract and authorise the call
+    ///                       (`require_auth`), which it does implicitly when it
+    ///                       is the direct invoker.
+    /// * `sender`          — Original escrow sender.
+    /// * `recipient`       — Intended escrow recipient.
+    /// * `amount`          — USDC amount (in stroops) already transferred.
     pub fn open_escrow_dispute(
         env: Env,
         escrow_contract: Address,
@@ -500,6 +508,9 @@ impl DisputeResolutionContract {
         }
         // A contract address only passes require_auth when that contract is the
         // direct invoker, so this proves the registered escrow is the caller.
+        // Soroban has no implicit "msg.sender". When the escrow contract
+        // invokes this function directly, its own address is authorised
+        // automatically; any other invoker cannot produce this auth.
         escrow_contract.require_auth();
 
         let id: u64 = env
@@ -1374,6 +1385,8 @@ impl DisputeResolutionContract {
         
         let total = user_disputes.len();
         let actual_start = if start > total { total } else { start };
+        let total: u32 = user_disputes.len();
+        let actual_start = start.min(total);
         let actual_end = actual_start.saturating_add(capped_limit).min(total);
 
         let mut result: Vec<u64> = Vec::new(&env);
@@ -1391,9 +1404,9 @@ impl DisputeResolutionContract {
         let capped_limit = if limit > 50 { 50 } else { limit };
         let total_disputes: u64 = env.storage().persistent().get(&DataKey::TotalDisputes).unwrap_or(0);
         
-        let actual_start = if start as u64 > total_disputes { total_disputes } else { start as u64 };
-        let actual_end = if actual_start + capped_limit as u64 > total_disputes { total_disputes } else { actual_start + capped_limit as u64 };
-        
+        let actual_start = (start as u64).min(total_disputes);
+        let actual_end = actual_start.saturating_add(capped_limit as u64).min(total_disputes);
+
         let mut result: Vec<u64> = Vec::new(&env);
         for i in actual_start..actual_end {
             result.push_back(i + 1); // Dispute IDs are 1-indexed

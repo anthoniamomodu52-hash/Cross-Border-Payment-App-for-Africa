@@ -36,6 +36,15 @@ fn mint_usdc(env: &Env, usdc_id: &Address, _admin: &Address, to: &Address, amoun
     StellarAssetClient::new(env, usdc_id).mint(to, &amount);
 }
 
+/// Default cancel hold period (24 h) — mirrors `DEFAULT_CANCEL_HOLD_SECS`.
+const CANCEL_HOLD_SECS: u64 = 24 * 60 * 60;
+
+fn advance_past_cancel_hold(env: &Env) {
+    env.ledger().with_mut(|li| {
+        li.timestamp += CANCEL_HOLD_SECS;
+    });
+}
+
 #[test]
 fn test_initialize() {
     let (_, client, admin, usdc_id) = setup();
@@ -365,6 +374,8 @@ fn test_cancel_escrow() {
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
 
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &100);
+    advance_past_cancel_hold(&env);
     client.cancel_escrow(&sender, &escrow_id);
 
     let escrow = client.get_escrow(&escrow_id);
@@ -573,6 +584,7 @@ fn test_cleanup_escrow_after_retention() {
 
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    advance_past_cancel_hold(&env);
     client.cancel_escrow(&sender, &escrow_id);
 
     env.ledger().with_mut(|li| {
@@ -596,6 +608,7 @@ fn test_cleanup_escrow_is_permissionless() {
 
     mint_usdc(&env, &usdc_id, &admin, &sender, 1_000_0000000i128);
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &1_000_0000000i128, &250);
+    advance_past_cancel_hold(&env);
     client.cancel_escrow(&sender, &escrow_id);
 
     env.ledger().with_mut(|li| {
@@ -943,6 +956,7 @@ fn test_expire_escrow_on_cancelled_escrow_panics() {
 
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    advance_past_cancel_hold(&env);
     client.cancel_escrow(&sender, &escrow_id);
 
     let anyone = Address::generate(&env);
@@ -1644,6 +1658,84 @@ fn test_expired_dispute_outcome_is_reported_to_escrow() {
 #[should_panic]
 fn test_close_disputed_escrow_rejects_other_callers() {
     let (env, escrow, _, _, admin, usdc_id, _) = setup_with_dispute();
+// ── Cancel hold period (sender front-running protection) ─────────────────────
+
+#[test]
+#[should_panic(expected = "Cannot cancel: hold period has not elapsed")]
+fn test_cancel_before_hold_period_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+
+    mint_usdc(&env, &usdc_id, &admin, &sender, 1_000_0000000);
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &250);
+    client.cancel_escrow(&sender, &escrow_id);
+}
+
+#[test]
+#[should_panic(expected = "Cannot cancel: hold period has not elapsed")]
+fn test_cancel_one_second_before_hold_ends_panics() {
+    let (env, client, admin, usdc_id) = setup();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+
+    mint_usdc(&env, &usdc_id, &admin, &sender, 1_000_0000000);
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &250);
+    env.ledger().with_mut(|li| {
+        li.timestamp += CANCEL_HOLD_SECS - 1;
+    });
+    client.cancel_escrow(&sender, &escrow_id);
+}
+
+#[test]
+fn test_cancel_exactly_at_hold_end_succeeds() {
+    let (env, client, admin, usdc_id) = setup();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let amount = 1_000_0000000i128;
+
+    mint_usdc(&env, &usdc_id, &admin, &sender, amount);
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    assert_eq!(
+        client.get_cancellable_at(&escrow_id),
+        client.get_escrow(&escrow_id).created_at + CANCEL_HOLD_SECS
+    );
+    advance_past_cancel_hold(&env);
+    client.cancel_escrow(&sender, &escrow_id);
+
+    assert!(client.get_escrow(&escrow_id).status == EscrowStatus::Cancelled);
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&sender), amount);
+}
+
+#[test]
+fn test_agent_confirm_within_hold_blocks_later_cancel() {
+    // The agent pays fiat off-chain and confirms during the hold window; the
+    // sender can no longer cancel once the window ends.
+    let (env, client, admin, usdc_id) = setup();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+
+    mint_usdc(&env, &usdc_id, &admin, &sender, 1_000_0000000);
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &250);
+    client.confirm_delivery(&agent, &escrow_id);
+    advance_past_cancel_hold(&env);
+
+    assert!(client.try_cancel_escrow(&sender, &escrow_id).is_err());
+    assert!(client.get_escrow(&escrow_id).status == EscrowStatus::Pending);
+}
+
+#[test]
+fn test_admin_can_update_cancel_hold_period() {
+    let (env, client, admin, usdc_id) = setup();
+    assert_eq!(client.get_cancel_hold_period(), CANCEL_HOLD_SECS);
+
+    client.set_cancel_hold_period(&admin, &3600);
+    assert_eq!(client.get_cancel_hold_period(), 3600);
+
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     let agent = Address::generate(&env);
@@ -1666,4 +1758,25 @@ fn test_close_disputed_escrow_requires_dispute() {
     mint_usdc(&env, &usdc_id, &admin, &sender, 1_000_0000000);
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &250);
     client.close_disputed_escrow(&escrow_id, &sender);
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &250);
+    env.ledger().with_mut(|li| {
+        li.timestamp += 3600;
+    });
+    client.cancel_escrow(&sender, &escrow_id);
+    assert!(client.get_escrow(&escrow_id).status == EscrowStatus::Cancelled);
+}
+
+#[test]
+#[should_panic(expected = "Only admin can perform this action")]
+fn test_non_admin_cannot_set_cancel_hold_period() {
+    let (env, client, _, _) = setup();
+    let impostor = Address::generate(&env);
+    client.set_cancel_hold_period(&impostor, &0);
+}
+
+#[test]
+#[should_panic(expected = "Hold period exceeds maximum of 7 days")]
+fn test_cancel_hold_period_above_max_panics() {
+    let (_, client, admin, _) = setup();
+    client.set_cancel_hold_period(&admin, &(7 * 24 * 60 * 60 + 1));
 }

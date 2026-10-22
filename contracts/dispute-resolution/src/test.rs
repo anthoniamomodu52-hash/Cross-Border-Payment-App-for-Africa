@@ -734,4 +734,20 @@ fn test_open_escrow_dispute_unregistered_escrow_panics() {
     let agent = Address::generate(&env);
     client.set_escrow_contract(&admin, &escrow);
     client.open_escrow_dispute(&impostor, &1u64, &sender, &recipient, &agent, &500_0000000, &false);
+    // Drop the blanket auth mock: a caller that is not the escrow contract
+    // cannot produce `escrow.require_auth()`, so this must be rejected.
+    env.set_auths(&[]);
+    client.open_escrow_dispute(&escrow, &sender, &recipient, &500_0000000);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: escrow contract not registered")]
+fn test_open_escrow_dispute_unregistered_escrow_panics() {
+    let (env, client, admin, _, _, _) = setup();
+    let escrow = Address::generate(&env);
+    let impostor = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    client.set_escrow_contract(&admin, &escrow);
+    client.open_escrow_dispute(&impostor, &sender, &recipient, &500_0000000);
 }
