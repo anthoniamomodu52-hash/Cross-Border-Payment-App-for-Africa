@@ -65,7 +65,9 @@ pub struct EscrowParams {
     pub recipient: Address,
     pub agent: Address,
     pub amount: i128,
-    pub release_fee_bps: u32,
+    /// Highest platform fee (bps) the sender accepts for this escrow. The
+    /// escrow always uses the admin-configured fee; this is only a guard.
+    pub max_fee_bps: u32,
 }
 
 #[derive(Clone)]
@@ -114,6 +116,13 @@ pub struct FeesWithdrawn {
 #[contracttype]
 pub struct FeeUpdated {
     pub escrow_id: u64,
+    pub old_fee_bps: u32,
+    pub new_fee_bps: u32,
+}
+
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct PlatformFeeUpdated {
     pub old_fee_bps: u32,
     pub new_fee_bps: u32,
 }
@@ -176,6 +185,8 @@ pub enum DataKey {
     KycContractAddress,
     DisputeContractAddress,
     ContractVersion,
+    /// Platform fee (bps) applied to every new escrow. Set by the admin.
+    PlatformFeeBps,
 }
 
 const DEFAULT_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
@@ -183,6 +194,9 @@ const DEFAULT_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
 
 /// Maximum allowed fee: 10% (1000 bps) per issue #766.
 const MAX_FEE_BPS: u32 = 1000;
+
+/// Platform fee used until the admin calls `set_fee_bps`: 2.5% (250 bps).
+const DEFAULT_PLATFORM_FEE_BPS: u32 = 250;
 
 /// Minimum escrow amount in stroops to prevent integer-division rounding to zero fee.
 const MIN_ESCROW_AMOUNT: i128 = 100;
@@ -206,6 +220,23 @@ fn require_admin(env: &Env, admin: &Address) {
     if admin != &stored_admin {
         panic!("Only admin can perform this action");
     }
+}
+
+fn platform_fee_bps(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PlatformFeeBps)
+        .unwrap_or(DEFAULT_PLATFORM_FEE_BPS)
+}
+
+/// Returns the configured platform fee, panicking if it is higher than the
+/// sender's `max_fee_bps` guard.
+fn fee_for_new_escrow(env: &Env, max_fee_bps: u32) -> u32 {
+    let fee_bps = platform_fee_bps(env);
+    if fee_bps > max_fee_bps {
+        panic!("Platform fee exceeds max_fee_bps");
+    }
+    fee_bps
 }
 
 fn retention_period(env: &Env) -> u64 {
@@ -263,6 +294,9 @@ impl EscrowContract {
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::UsdcAddress, &usdc_address);
         env.storage().persistent().set(&DataKey::EscrowCounter, &0u64);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlatformFeeBps, &DEFAULT_PLATFORM_FEE_BPS);
         env.storage()
             .persistent()
             .set(&DataKey::ContractVersion, &CONTRACT_VERSION);
@@ -327,13 +361,18 @@ impl EscrowContract {
         );
     }
 
+    /// Lock `amount` USDC from `sender` in a new escrow.
+    ///
+    /// The release fee is the admin-configured platform fee (`get_fee_bps`),
+    /// never a caller-chosen value. `max_fee_bps` is a slippage guard: the
+    /// call fails if the configured fee is higher than the sender accepts.
     pub fn create_escrow(
         env: Env,
         sender: Address,
         recipient: Address,
         agent: Address,
         amount: i128,
-        release_fee_bps: u32,
+        max_fee_bps: u32,
     ) -> u64 {
         if amount < MIN_ESCROW_AMOUNT {
             panic!("Amount below minimum (100 stroops)");
@@ -341,12 +380,7 @@ impl EscrowContract {
         if amount > MAX_ESCROW_AMOUNT {
             panic!("Amount exceeds maximum escrow amount");
         }
-        if release_fee_bps == 10000 {
-            panic!("Fee cannot be 100%");
-        }
-        if release_fee_bps > MAX_FEE_BPS {
-            panic!("Fee exceeds maximum of 1000 bps (10%)");
-        }
+        let release_fee_bps = fee_for_new_escrow(&env, max_fee_bps);
         if sender == recipient || sender == agent || recipient == agent {
             panic!("Sender, recipient, and agent must be distinct addresses");
         }
@@ -1006,6 +1040,33 @@ impl EscrowContract {
         );
     }
 
+    /// Set the platform fee applied to new escrows. Admin only.
+    ///
+    /// Bounded by `MAX_FEE_BPS` (10%). Existing escrows keep the fee they were
+    /// created with. Emits `PlatformFeeUpdated`.
+    pub fn set_fee_bps(env: Env, admin: Address, fee_bps: u32) {
+        require_admin(&env, &admin);
+        if fee_bps > MAX_FEE_BPS {
+            panic!("Fee exceeds maximum of 1000 bps (10%)");
+        }
+        let old_fee_bps = platform_fee_bps(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlatformFeeBps, &fee_bps);
+        env.events().publish(
+            (Symbol::new(&env, "PlatformFeeUpdated"),),
+            PlatformFeeUpdated {
+                old_fee_bps,
+                new_fee_bps: fee_bps,
+            },
+        );
+    }
+
+    /// The platform fee (bps) that new escrows will use.
+    pub fn get_fee_bps(env: Env) -> u32 {
+        platform_fee_bps(&env)
+    }
+
     pub fn get_contract_version(env: Env) -> u32 {
         env.storage()
             .persistent()
@@ -1064,12 +1125,7 @@ impl EscrowContract {
             if escrow_params.amount > MAX_ESCROW_AMOUNT {
                 panic!("Amount exceeds maximum escrow amount");
             }
-            if escrow_params.release_fee_bps == 10000 {
-                panic!("Fee cannot be 100%");
-            }
-            if escrow_params.release_fee_bps > MAX_FEE_BPS {
-                panic!("Fee exceeds maximum of 1000 bps (10%)");
-            }
+            fee_for_new_escrow(&env, escrow_params.max_fee_bps);
             if sender == escrow_params.recipient
                 || sender == escrow_params.agent
                 || escrow_params.recipient == escrow_params.agent
@@ -1101,6 +1157,7 @@ impl EscrowContract {
 
         let first_id = current_id + 1;
         let now = env.ledger().timestamp();
+        let release_fee_bps = platform_fee_bps(&env);
 
         for escrow_params in escrows.iter() {
             let next_id = current_id.checked_add(1).expect("Escrow counter overflow");
@@ -1112,7 +1169,7 @@ impl EscrowContract {
                 recipient: escrow_params.recipient.clone(),
                 agent: escrow_params.agent.clone(),
                 amount: escrow_params.amount,
-                release_fee_bps: escrow_params.release_fee_bps,
+                release_fee_bps,
                 status: EscrowStatus::Pending,
                 payout_confirmed: false,
                 created_at: now,
@@ -1132,7 +1189,7 @@ impl EscrowContract {
                     recipient: escrow_params.recipient.clone(),
                     agent: escrow_params.agent.clone(),
                     amount: escrow_params.amount,
-                    release_fee_bps: escrow_params.release_fee_bps,
+                    release_fee_bps,
                 },
             );
         }

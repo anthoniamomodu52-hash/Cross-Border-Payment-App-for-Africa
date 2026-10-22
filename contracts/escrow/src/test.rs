@@ -7,8 +7,8 @@ use soroban_sdk::{
 };
 
 use crate::{
-    CONTRACT_VERSION, EscrowContract, EscrowContractClient, EscrowExpired, EscrowStatus,
-    FeesWithdrawn, PartialRelease,
+    CONTRACT_VERSION, EscrowContract, EscrowContractClient, EscrowExpired, EscrowParams,
+    EscrowStatus, FeesWithdrawn, PartialRelease, PlatformFeeUpdated,
 };
 
 fn setup() -> (Env, EscrowContractClient<'static>, Address, Address) {
@@ -102,7 +102,7 @@ fn test_create_multiple_escrows() {
     mint_usdc(&env, &usdc_id, &admin, &sender2, 500_0000000);
 
     let id1 = client.create_escrow(&sender1, &recipient, &agent, &1_000_0000000, &250);
-    let id2 = client.create_escrow(&sender2, &recipient, &agent, &500_0000000, &100);
+    let id2 = client.create_escrow(&sender2, &recipient, &agent, &500_0000000, &250);
 
     assert_eq!(id1, 1);
     assert_eq!(id2, 2);
@@ -124,25 +124,28 @@ fn test_amount_below_minimum() {
 }
 
 #[test]
-#[should_panic(expected = "Fee cannot be 100%")]
-fn test_fee_exactly_10000_rejected() {
+#[should_panic(expected = "Platform fee exceeds max_fee_bps")]
+fn test_direct_call_cannot_set_zero_fee() {
+    // #1364: a sender calling the contract directly cannot opt out of the fee.
     let (env, client, admin, usdc_id) = setup();
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     let agent = Address::generate(&env);
     mint_usdc(&env, &usdc_id, &admin, &sender, 1_000_0000000);
-    client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &10000);
+    client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &0);
 }
 
 #[test]
-#[should_panic(expected = "Fee exceeds maximum of 1000 bps (10%)")]
-fn test_fee_9999_rejected() {
+fn test_escrow_uses_configured_fee_not_caller_value() {
+    // A generous max_fee_bps does not raise the fee either.
     let (env, client, admin, usdc_id) = setup();
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     let agent = Address::generate(&env);
     mint_usdc(&env, &usdc_id, &admin, &sender, 1_000_0000000);
-    client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &9999);
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &9999);
+    assert_eq!(client.get_escrow(&escrow_id).release_fee_bps, client.get_fee_bps());
+    assert_eq!(client.get_fee_bps(), 250);
 }
 
 #[test]
@@ -153,6 +156,7 @@ fn test_fee_at_max_1000_accepted() {
     let agent = Address::generate(&env);
     let amount = 1_000_0000000i128;
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
+    client.set_fee_bps(&admin, &1000);
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &1000);
     assert_eq!(client.get_escrow(&escrow_id).release_fee_bps, 1000);
 }
@@ -160,12 +164,8 @@ fn test_fee_at_max_1000_accepted() {
 #[test]
 #[should_panic(expected = "Fee exceeds maximum of 1000 bps (10%)")]
 fn test_fee_bps_1001_rejected() {
-    let (env, client, admin, usdc_id) = setup();
-    let sender = Address::generate(&env);
-    let recipient = Address::generate(&env);
-    let agent = Address::generate(&env);
-    mint_usdc(&env, &usdc_id, &admin, &sender, 1_000_0000000);
-    client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &1001);
+    let (_, client, admin, _) = setup();
+    client.set_fee_bps(&admin, &1001);
 }
 
 #[test]
@@ -202,6 +202,7 @@ fn test_fee_bps_zero_accepted() {
     let agent = Address::generate(&env);
     let amount = 1_000_0000000i128;
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
+    client.set_fee_bps(&admin, &0);
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &0);
     assert_eq!(client.get_escrow(&escrow_id).release_fee_bps, 0);
 }
@@ -214,6 +215,7 @@ fn test_fee_bps_one_accepted() {
     let agent = Address::generate(&env);
     let amount = 1_000_0000000i128;
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
+    client.set_fee_bps(&admin, &1);
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &1);
     assert_eq!(client.get_escrow(&escrow_id).release_fee_bps, 1);
 }
@@ -226,6 +228,7 @@ fn test_fee_bps_999_accepted() {
     let agent = Address::generate(&env);
     let amount = 1_000_0000000i128;
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
+    client.set_fee_bps(&admin, &999);
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &999);
     assert_eq!(client.get_escrow(&escrow_id).release_fee_bps, 999);
 }
@@ -256,12 +259,72 @@ fn test_invalid_amount() {
 #[test]
 #[should_panic(expected = "Fee exceeds maximum of 1000 bps (10%)")]
 fn test_invalid_fee() {
+    let (_, client, admin, _) = setup();
+    client.set_fee_bps(&admin, &10001);
+}
+
+#[test]
+#[should_panic(expected = "Only admin can perform this action")]
+fn test_set_fee_bps_non_admin_panics() {
+    let (env, client, _, _) = setup();
+    let impostor = Address::generate(&env);
+    client.set_fee_bps(&impostor, &0);
+}
+
+#[test]
+fn test_set_fee_bps_emits_event() {
+    let (env, client, admin, _) = setup();
+    client.set_fee_bps(&admin, &400);
+    assert_eq!(client.get_fee_bps(), 400);
+    let (_, _, data) = find_event(&env, "PlatformFeeUpdated").expect("event not emitted");
+    let payload = PlatformFeeUpdated::from_val(&env, &data);
+    assert_eq!(payload.old_fee_bps, 250);
+    assert_eq!(payload.new_fee_bps, 400);
+}
+
+#[test]
+fn test_fee_change_does_not_affect_existing_escrow() {
     let (env, client, admin, usdc_id) = setup();
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     let agent = Address::generate(&env);
     mint_usdc(&env, &usdc_id, &admin, &sender, 1_000_0000000);
-    client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &10001);
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &1_000_0000000, &250);
+    client.set_fee_bps(&admin, &1000);
+    assert_eq!(client.get_escrow(&escrow_id).release_fee_bps, 250);
+}
+
+#[test]
+fn test_batch_create_uses_configured_fee() {
+    let (env, client, admin, usdc_id) = setup();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    mint_usdc(&env, &usdc_id, &admin, &sender, 2_000_0000000);
+    let params = EscrowParams {
+        recipient: recipient.clone(),
+        agent: agent.clone(),
+        amount: 1_000_0000000,
+        max_fee_bps: 1000,
+    };
+    let first = client.batch_create_escrow(&sender, &soroban_sdk::vec![&env, params.clone(), params]);
+    assert_eq!(client.get_escrow(&first).release_fee_bps, 250);
+    assert_eq!(client.get_escrow(&(first + 1)).release_fee_bps, 250);
+}
+
+#[test]
+#[should_panic(expected = "Platform fee exceeds max_fee_bps")]
+fn test_batch_create_rejects_zero_fee_guard() {
+    let (env, client, admin, usdc_id) = setup();
+    let sender = Address::generate(&env);
+    mint_usdc(&env, &usdc_id, &admin, &sender, 1_000_0000000);
+    let params = EscrowParams {
+        recipient: Address::generate(&env),
+        agent: Address::generate(&env),
+        amount: 1_000_0000000,
+        max_fee_bps: 0,
+    };
+    client.batch_create_escrow(&sender, &soroban_sdk::vec![&env, params]);
 }
 
 #[test]
@@ -301,7 +364,7 @@ fn test_cancel_escrow() {
 
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
 
-    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &100);
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &250);
     client.cancel_escrow(&sender, &escrow_id);
 
     let escrow = client.get_escrow(&escrow_id);
@@ -618,6 +681,7 @@ fn test_withdraw_fees() {
     let fee_bps = 500u32;
 
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
+    client.set_fee_bps(&admin, &fee_bps);
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &fee_bps);
     client.release_escrow(&agent, &escrow_id);
 
@@ -642,6 +706,7 @@ fn test_withdraw_fees_emits_event() {
     let fee_bps = 500u32;
 
     mint_usdc(&env, &usdc_id, &admin, &sender, amount);
+    client.set_fee_bps(&admin, &fee_bps);
     let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &fee_bps);
     client.release_escrow(&agent, &escrow_id);
 

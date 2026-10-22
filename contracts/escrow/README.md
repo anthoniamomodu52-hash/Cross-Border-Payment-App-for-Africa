@@ -103,20 +103,23 @@ fn create_escrow(
     recipient: Address,
     agent: Address,
     amount: i128,
-    release_fee_bps: u32,
+    max_fee_bps: u32,
 ) -> u64
 ```
 
 Description:
 - Creates a new escrow entry and transfers USDC from the sender to the contract.
 - Stores sender, recipient, agent, amount, fee, status, timestamps, and expiry.
+- The escrow's `release_fee_bps` is always the admin-configured platform fee
+  (`get_fee_bps`). The caller cannot choose it (#1364).
 
 Parameters:
 - `sender` (`Address`) - originator who must authorize the transfer.
 - `recipient` (`Address`) - the intended final beneficiary.
 - `agent` (`Address`) - the account that can release the escrow.
 - `amount` (`i128`) - USDC amount in stroops (`1 USDC = 10^7 stroops`).
-- `release_fee_bps` (`u32`) - release fee in basis points (max 5000).
+- `max_fee_bps` (`u32`) - slippage guard: the highest platform fee the sender
+  accepts. The call fails if the configured fee is higher.
 
 Returns:
 - `u64` - the newly created escrow ID.
@@ -126,13 +129,27 @@ Authorization:
 
 Panics / Errors:
 - `Amount below minimum (100 stroops)` if `amount < 100`.
-- `Fee cannot be 100%` if `release_fee_bps == 10000`.
-- `Fee exceeds maximum of 5000 bps (50%)` if `release_fee_bps > 5000`.
+- `Platform fee exceeds max_fee_bps` if the configured fee is above `max_fee_bps`.
 - `Sender, recipient, and agent must be distinct addresses` if any two roles overlap.
 - Panics from the underlying USDC token transfer if the sender has insufficient allowance or balance.
 
 Events:
 - `EscrowCreated`
+
+---
+
+### `set_fee_bps` / `get_fee_bps`
+
+```rust
+fn set_fee_bps(env: Env, admin: Address, fee_bps: u32)
+fn get_fee_bps(env: Env) -> u32
+```
+
+- Admin-only setter for the platform fee applied to **new** escrows. Defaults
+  to 250 bps (2.5%) at `initialize`.
+- Panics with `Fee exceeds maximum of 1000 bps (10%)` if `fee_bps > 1000`.
+- Existing escrows keep the fee they were created with.
+- Emits `PlatformFeeUpdated { old_fee_bps, new_fee_bps }`.
 
 ---
 
@@ -609,6 +626,7 @@ This contract stores state under the following `DataKey` variants in persistent 
 - `DataKey::Escrow(u64)` -> `Escrow`
 - `DataKey::DisputeContractAddress` -> `Address` (dispute-resolution contract used by `dispute_escrow`)
 - `DataKey::ContractVersion` -> `u32`
+- `DataKey::PlatformFeeBps` -> `u32` (fee applied to new escrows; see `set_fee_bps`)
 
 ### `Escrow` struct layout
 
@@ -685,13 +703,15 @@ function addressToScVal(address) {
   return xdr.ScVal.scvAddress(xdr.ScAddress.publicKeyTypeEd25519(address));
 }
 
-async function createEscrow(senderKeypair, recipientAddress, agentAddress, amountStroops, feeBps) {
+// maxFeeBps is a guard, not the fee: the contract applies its configured
+// platform fee (get_fee_bps) and rejects the call if that is above maxFeeBps.
+async function createEscrow(senderKeypair, recipientAddress, agentAddress, amountStroops, maxFeeBps) {
   const args = [
     addressToScVal(senderKeypair.publicKey()),
     addressToScVal(recipientAddress),
     addressToScVal(agentAddress),
     xdr.ScVal.scvI128(amountStroops.toString()),
-    xdr.ScVal.scvU32(feeBps),
+    xdr.ScVal.scvU32(maxFeeBps),
   ];
 
   return invokeContract(senderKeypair, 'create_escrow', args);
@@ -701,7 +721,7 @@ async function createEscrow(senderKeypair, recipientAddress, agentAddress, amoun
 ### Recommended call flow
 
 1. Deploy and initialize the contract with `initialize(admin, usdc_address)`.
-2. Call `create_escrow(sender, recipient, agent, amount, release_fee_bps)`.
+2. Call `create_escrow(sender, recipient, agent, amount, max_fee_bps)`.
 3. Optionally call `deposit(sender, escrow_id, amount)` to add funds.
 4. Call `confirm_delivery(agent, escrow_id)` after the agent confirms off-chain payout.
 5. Call `partial_release(agent, escrow_id, amount)` to release funds in installments, or `release_escrow(agent, escrow_id)` to release the remaining balance.
