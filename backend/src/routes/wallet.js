@@ -2,6 +2,7 @@ const router = require('express').Router();
 const { body, param, query, validationResult } = require('express-validator');
 const StellarSdk = require('@stellar/stellar-sdk');
 const authMiddleware = require('../middleware/auth');
+const { requireStepUp } = require('../middleware/requireStepUp');
 const { readLimiter, exportKeyLimiter } = require('../middleware/rateLimiter');
 const {
   getWallet,
@@ -89,6 +90,7 @@ router.post(
     body('pin').optional().matches(/^\d{4,6}$/).withMessage('PIN must be 4-6 digits'),
   ],
   validate,
+  requireStepUp,
   exportKey,
 );
 
@@ -143,6 +145,7 @@ router.post(
     body('wallet_id').optional().isUUID().withMessage('wallet_id must be a valid UUID'),
   ],
   validate,
+  requireStepUp,
   mergeWallet,
 );
 
