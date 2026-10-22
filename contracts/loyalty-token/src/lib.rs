@@ -78,9 +78,10 @@ pub enum DataKey {
     SnapshotCount,
     /// Ledger sequence at which a snapshot was taken.
     SnapshotLedger(u32),
-    /// Per-account checkpoint history: `Vec<(ledger, balance)>` written lazily
-    /// on every balance change. Used to reconstruct historical balances without
-    /// iterating over all holders.
+    /// Per-account checkpoint history: `Vec<(snapshot_id, balance)>` sorted by
+    /// id. An entry is written only on the first balance change after a new
+    /// snapshot and records the balance held at that snapshot, so the vector
+    /// holds at most one entry per snapshot.
     Checkpoints(Address),
     /// Maps a tier index (0–4) to its Tier configuration.
     Tier(u32),
@@ -232,36 +233,79 @@ impl LoyaltyTokenContract {
             .persistent()
             .set(&DataKey::SnapshotLedger(snapshot_id), &env.ledger().sequence());
 
+        env.events().publish(
+            (symbol_short!("snapshot"), symbol_short!("created")),
+            (snapshot_id, env.ledger().sequence()),
+        );
+
         snapshot_id
+    }
+
+    /// Delete a snapshot, freeing a slot under the active-snapshot limit. Admin only.
+    pub fn delete_snapshot(env: Env, admin: Address, snapshot_id: u32) {
+        admin.require_auth();
+
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+
+        let key = DataKey::SnapshotLedger(snapshot_id);
+        if !env.storage().persistent().has(&key) {
+            panic!("unknown snapshot");
+        }
+        env.storage().persistent().remove(&key);
+
+        let active_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SnapshotCount)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SnapshotCount, &active_count.saturating_sub(1));
+
+        env.events().publish(
+            (symbol_short!("snapshot"), symbol_short!("deleted")),
+            snapshot_id,
+        );
     }
 
     /// Return the balance recorded for a holder at the specified snapshot.
     ///
     /// Reconstructed from the per-account checkpoint history: the balance is the
-    /// value of the latest checkpoint at or before the snapshot's ledger. Returns
-    /// 0 when the account had no balance at that ledger.
+    /// value of the first checkpoint with id >= `snapshot_id` (binary search).
+    /// When none exists the balance hasn't changed since and the current balance
+    /// is returned.
     pub fn snapshot_balance(env: Env, snapshot_id: u32, account: Address) -> i128 {
-        let ledger: u32 = env
+        if !env
             .storage()
             .persistent()
-            .get(&DataKey::SnapshotLedger(snapshot_id))
-            .expect("unknown snapshot");
+            .has(&DataKey::SnapshotLedger(snapshot_id))
+        {
+            panic!("unknown snapshot");
+        }
 
         let checkpoints: Vec<(u32, i128)> = env
             .storage()
             .persistent()
-            .get(&DataKey::Checkpoints(account))
+            .get(&DataKey::Checkpoints(account.clone()))
             .unwrap_or(Vec::new(&env));
 
-        let mut balance: i128 = 0;
-        for (cp_ledger, cp_balance) in checkpoints.iter() {
-            if cp_ledger <= ledger {
-                balance = cp_balance;
+        let (mut lo, mut hi) = (0u32, checkpoints.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if checkpoints.get_unchecked(mid).0 < snapshot_id {
+                lo = mid + 1;
             } else {
-                break;
+                hi = mid;
             }
         }
-        balance
+        if lo < checkpoints.len() {
+            checkpoints.get_unchecked(lo).1
+        } else {
+            Self::balance(env, account)
+        }
     }
 
     // ── SEP-41: allowances ────────────────────────────────────────────────────
@@ -406,8 +450,8 @@ impl LoyaltyTokenContract {
     /// and data `amount`.
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
-        if amount < 0 {
-            panic!("amount must be non-negative");
+        if amount <= 0 {
+            panic!("amount must be positive");
         }
         Self::move_balance(&env, &from, &to, amount);
         env.events().publish(
@@ -422,8 +466,8 @@ impl LoyaltyTokenContract {
     /// and data `amount`.
     pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
         spender.require_auth();
-        if amount < 0 {
-            panic!("amount must be non-negative");
+        if amount <= 0 {
+            panic!("amount must be positive");
         }
         Self::spend_allowance(&env, &from, &spender, amount);
         Self::move_balance(&env, &from, &to, amount);
@@ -550,19 +594,33 @@ impl LoyaltyTokenContract {
         Self::set_balance(env, to, to_balance + amount);
     }
 
-    /// Persist a balance and append a checkpoint for historical reconstruction.
+    /// Persist a balance. If a snapshot was taken since this account's last
+    /// checkpoint, first record the pre-change balance against that snapshot.
     fn set_balance(env: &Env, account: &Address, balance: i128) {
+        let latest_snapshot: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SnapshotCounter)
+            .unwrap_or(0);
+        if latest_snapshot > 0 {
+            let key = DataKey::Checkpoints(account.clone());
+            let mut checkpoints: Vec<(u32, i128)> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or(Vec::new(env));
+            let needs_checkpoint = match checkpoints.last() {
+                Some((id, _)) => id < latest_snapshot,
+                None => true,
+            };
+            if needs_checkpoint {
+                let previous = Self::balance(env.clone(), account.clone());
+                checkpoints.push_back((latest_snapshot, previous));
+                env.storage().persistent().set(&key, &checkpoints);
+            }
+        }
         env.storage()
             .persistent()
             .set(&DataKey::Balance(account.clone()), &balance);
-        let mut checkpoints: Vec<(u32, i128)> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Checkpoints(account.clone()))
-            .unwrap_or(Vec::new(env));
-        checkpoints.push_back((env.ledger().sequence(), balance));
-        env.storage()
-            .persistent()
-            .set(&DataKey::Checkpoints(account.clone()), &checkpoints);
     }
 }
