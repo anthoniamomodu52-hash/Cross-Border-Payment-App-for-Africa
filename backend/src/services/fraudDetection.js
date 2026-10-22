@@ -3,9 +3,13 @@
 const db = require('../db');
 const cache = require('../utils/cache');
 const logger = require('../utils/logger');
+const { fraudRuleErrorsTotal } = require('../utils/metrics');
 
 const RULES_CACHE_KEY = 'fraud:rules';
 const RULES_CACHE_TTL = 300; // 5 minutes
+
+// BE-178: last successfully loaded rule set, used when the DB/cache is unavailable.
+let lastKnownRules = null;
 
 // ---------------------------------------------------------------------------
 // Rule loading
@@ -13,11 +17,15 @@ const RULES_CACHE_TTL = 300; // 5 minutes
 
 async function loadRules() {
   const cached = await cache.get(RULES_CACHE_KEY);
-  if (cached) return cached;
+  if (Array.isArray(cached)) {
+    lastKnownRules = cached;
+    return cached;
+  }
 
   const { rows } = await db.query(
     `SELECT id, name, rule_type, parameters, mode FROM fraud_rules WHERE is_active = true`
   );
+  lastKnownRules = rows;
   await cache.set(RULES_CACHE_KEY, rows, RULES_CACHE_TTL);
   return rows;
 }
@@ -98,15 +106,27 @@ const EVALUATORS = {
 
 /**
  * Evaluate all active fraud rules against a payment.
- * Returns { blocked, rule, message } where blocked=false if no rule triggers.
+ * Returns { blocked, rule, message, reason } where blocked=false if no rule
+ * triggers. `reason` mirrors `message` for callers that read it (BE-151).
  */
 async function checkFraud(walletAddress, amount, asset, paymentId = null) {
   let rules;
   try {
     rules = await loadRules();
   } catch (err) {
-    logger.warn('Failed to load fraud rules, falling back to pass-through', { error: err.message });
-    return { blocked: false };
+    fraudRuleErrorsTotal.inc({ stage: 'load', rule: '' });
+    if (lastKnownRules) {
+      logger.error('Failed to load fraud rules, using last known rule set', { error: err.message });
+      rules = lastKnownRules;
+    } else {
+      // No rules ever loaded: fail closed above the configured USD threshold.
+      const thresholdUsd = parseFloat(process.env.FRAUD_FAIL_CLOSED_THRESHOLD_USD || '1000');
+      logger.error('Failed to load fraud rules and no cached rules available', { error: err.message });
+      if (toUsd(amount, asset) > thresholdUsd) {
+        throw Object.assign(new Error('Fraud screening is temporarily unavailable. Please try again later.'), { status: 503 });
+      }
+      return { blocked: false };
+    }
   }
 
   for (const rule of rules) {
@@ -117,7 +137,8 @@ async function checkFraud(walletAddress, amount, asset, paymentId = null) {
     try {
       result = await evaluator(rule, walletAddress, amount, asset);
     } catch (err) {
-      logger.warn('Fraud rule evaluation error', { rule: rule.name, error: err.message });
+      fraudRuleErrorsTotal.inc({ stage: 'evaluate', rule: rule.name });
+      logger.error('Fraud rule evaluation error', { rule: rule.name, error: err.message });
       continue;
     }
 
@@ -151,6 +172,8 @@ async function checkFraud(walletAddress, amount, asset, paymentId = null) {
         rule_type: rule.rule_type,
         message: result.message,
         retry_after: result.retry_after,
+        message: result.message,
+        reason: result.message,
       };
     }
   }
@@ -187,11 +210,11 @@ async function checkDailyLimit(walletAddress, amount, asset) {
   return sentUsd + newUsd > limitUsd;
 }
 
-async function logFraudBlock(walletAddress, reason, amount, asset) {
+async function logFraudBlock(walletAddress, reason, amount, asset, rule = null) {
   await db.query(
-    `INSERT INTO fraud_blocks (wallet_address, reason, amount, asset)
-     VALUES ($1, $2, $3, $4)`,
-    [walletAddress, reason, amount, asset]
+    `INSERT INTO fraud_blocks (wallet_address, reason, rule, amount, asset)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [walletAddress, reason, rule, amount, asset]
   );
 }
 
