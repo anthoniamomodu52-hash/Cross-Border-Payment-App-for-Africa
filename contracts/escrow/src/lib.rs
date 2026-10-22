@@ -142,7 +142,9 @@ pub struct EscrowDisputed {
     pub escrow_id: u64,
     pub dispute_id: u64,
     pub opener: Address,
+    pub agent: Address,
     pub amount: i128,
+    pub payout_confirmed: bool,
 }
 
 #[derive(Clone)]
@@ -618,9 +620,12 @@ impl EscrowContract {
 
     /// Escalate a pending escrow to the configured dispute-resolution contract.
     ///
-    /// Either the escrow sender or recipient may open a dispute — this is the
-    /// sender's recourse when the agent has confirmed delivery but has not
-    /// released funds (and `cancel_escrow` is therefore blocked).
+    /// Before the agent confirms delivery, either the sender or the recipient
+    /// may open a dispute. After `confirm_delivery` the agent has already paid
+    /// out fiat, so only the recipient (who would know the payout never
+    /// arrived) may dispute; the sender may not (#1366). The agent is
+    /// registered as a dispute party and can be awarded the funds, and a
+    /// post-confirmation dispute that expires unresolved pays the agent.
     ///
     /// The full remaining escrow balance is transferred to the dispute-resolution
     /// contract, which takes custody of it for arbitration. The escrow is then
@@ -628,7 +633,8 @@ impl EscrowContract {
     /// into, or expired. The adjudicated winner is paid by the dispute contract.
     ///
     /// # Arguments
-    /// * `caller`   — Must be the escrow sender or recipient (auth required).
+    /// * `caller`   — The escrow recipient, or the sender before delivery is
+    ///                confirmed (auth required).
     /// * `escrow_id` — The escrow to escalate.
     ///
     /// # Returns
@@ -653,6 +659,9 @@ impl EscrowContract {
         }
         if escrow.status != EscrowStatus::Pending {
             panic!("Escrow is not in pending state");
+        }
+        if escrow.payout_confirmed && caller == escrow.sender {
+            panic!("Delivery confirmed: only the recipient can dispute");
         }
 
         let usdc_address: Address = env
@@ -685,7 +694,9 @@ impl EscrowContract {
                 env.current_contract_address().into_val(&env),
                 escrow.sender.clone().into_val(&env),
                 escrow.recipient.clone().into_val(&env),
-                escrow.amount.into_val(&env)
+                escrow.agent.clone().into_val(&env),
+                escrow.amount.into_val(&env),
+                escrow.payout_confirmed.into_val(&env)
             ],
         );
 
@@ -695,7 +706,9 @@ impl EscrowContract {
                 escrow_id,
                 dispute_id,
                 opener: caller,
+                agent: escrow.agent.clone(),
                 amount: escrow.amount,
+                payout_confirmed: escrow.payout_confirmed,
             },
         );
 

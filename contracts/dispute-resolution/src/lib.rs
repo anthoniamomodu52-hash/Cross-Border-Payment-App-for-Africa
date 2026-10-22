@@ -11,6 +11,11 @@
 //!                         via [`resolve_dispute`] OR participates in the panel via
 //!                         [`cast_vote`]
 //! - **SuperArbitrator** — elevated authority who handles appeals
+//! - **Agent**           — (escrow disputes only) the payout agent who pays the
+//!                         recipient in fiat. May submit evidence, appeal, and be
+//!                         awarded the funds via [`resolve_dispute_for_agent`] /
+//!                         [`resolve_appeal_for_agent`]. The multi-arbitrator panel
+//!                         votes only for sender or recipient.
 //!
 //! ## Flow (single-arbitrator path)
 //! 1. Either party calls [`open_dispute`] — escrowed funds are locked for arbitration.
@@ -88,6 +93,15 @@ pub enum DataKey {
     /// Address of the escrow contract authorised to push funds into disputes
     /// via [`open_escrow_dispute`]. Set by the admin during setup.
     EscrowContract,
+    /// Payout agent of an escrow-backed dispute. Absent for free-form disputes.
+    DisputeAgent(u64),
+    /// `true` if the agent had confirmed fiat delivery before the escrow
+    /// dispute was opened. Unresolved disputes then default to the agent.
+    PayoutConfirmed(u64),
+    /// Evidence (IPFS CID / hash) submitted by the agent of an escrow dispute.
+    AgentEvidence(u64),
+    /// Present while the pending (or final) ruling awards the funds to the agent.
+    RulingForAgent(u64),
 }
 
 // ── Domain types ──────────────────────────────────────────────────────────────
@@ -110,6 +124,9 @@ pub enum DisputeStatus {
     Appealing,
     /// A party has filed an appeal; awaiting super-arbitrator decision.
     UnderAppeal,
+    /// Resolved in favour of the payout agent of an escrow dispute — funds
+    /// released to the agent.
+    ResolvedForAgent,
 }
 
 /// On-chain dispute record.
@@ -151,6 +168,26 @@ pub struct EvtDisputeOpened {
     pub recipient: Address,
     pub amount: i128,
     pub deadline: u64,
+}
+
+/// Emitted by [`DisputeResolutionContract::open_escrow_dispute`] alongside
+/// `DisputeOpened`, carrying the escrow-specific parties and state.
+#[derive(Clone)]
+#[contracttype]
+pub struct EvtEscrowDisputeOpened {
+    pub dispute_id: u64,
+    pub agent: Address,
+    pub payout_confirmed: bool,
+}
+
+/// Emitted when an unresolved dispute over a payout-confirmed escrow expires
+/// and the agent claims the funds.
+#[derive(Clone)]
+#[contracttype]
+pub struct EvtDisputeExpiredToAgent {
+    pub dispute_id: u64,
+    pub agent: Address,
+    pub amount: i128,
 }
 
 #[derive(Clone)]
@@ -204,6 +241,55 @@ pub struct EvtQuorumReached {
     pub for_recipient: bool,
     pub winner: Address,
     pub amount: i128,
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Who a ruling awards the disputed funds to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ruling {
+    Sender,
+    Recipient,
+    Agent,
+}
+
+fn dispute_agent(env: &Env, dispute_id: u64) -> Option<Address> {
+    env.storage().persistent().get(&DataKey::DisputeAgent(dispute_id))
+}
+
+fn payout_confirmed(env: &Env, dispute_id: u64) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PayoutConfirmed(dispute_id))
+        .unwrap_or(false)
+}
+
+/// The ruling currently recorded on a dispute in `Appealing` status.
+fn pending_ruling(env: &Env, dispute: &Dispute) -> Ruling {
+    if env.storage().persistent().has(&DataKey::RulingForAgent(dispute.id)) {
+        Ruling::Agent
+    } else if dispute.resolved_for_recipient {
+        Ruling::Recipient
+    } else {
+        Ruling::Sender
+    }
+}
+
+/// Record `ruling` as the pending decision on `dispute` (not yet persisted).
+fn record_ruling(env: &Env, dispute: &mut Dispute, ruling: Ruling) {
+    if ruling == Ruling::Agent {
+        if dispute_agent(env, dispute.id).is_none() {
+            panic!("dispute has no agent");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::RulingForAgent(dispute.id), &true);
+    } else {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RulingForAgent(dispute.id));
+    }
+    dispute.resolved_for_recipient = ruling == Ruling::Recipient;
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -359,28 +445,28 @@ impl DisputeResolutionContract {
 
     /// Open a dispute backed by funds held in an escrow contract.
     ///
-    /// Cross-contract hook called by the escrow contract (see
-    /// `contracts/escrow`). The escrow has already transferred `amount` USDC
-    /// into this contract's custody; this function records the dispute so the
-    /// normal resolution/appeal/expiry flow applies. The adjudicated winner is
-    /// paid directly from the locked funds.
+    /// Cross-contract hook called by the registered escrow contract, which has
+    /// already transferred `amount` USDC into this contract's custody. No
+    /// filing fee is charged.
     ///
-    /// Unlike [`open_dispute`], no filing fee is charged: the escrow contract
-    /// transfers only the disputed `amount`, and only the registered escrow
-    /// contract may call this function.
+    /// The escrow's payout `agent` is a third party: it may submit evidence,
+    /// appeal, and be awarded the funds. If the agent had already confirmed
+    /// delivery (`payout_confirmed`), an unresolved dispute defaults to the
+    /// agent on expiry instead of refunding the sender.
     ///
     /// # Arguments
-    /// * `escrow_contract` — The calling escrow contract. Must be the immediate
-    ///                       caller and match the registered escrow contract.
-    /// * `sender`          — Original escrow sender.
-    /// * `recipient`       — Intended escrow recipient.
-    /// * `amount`          — USDC amount (in stroops) already transferred.
+    /// * `escrow_contract`  — Calling escrow contract (must be registered).
+    /// * `sender`, `recipient`, `agent` — Escrow parties.
+    /// * `amount`           — USDC (stroops) already transferred.
+    /// * `payout_confirmed` — Whether the agent had called `confirm_delivery`.
     pub fn open_escrow_dispute(
         env: Env,
         escrow_contract: Address,
         sender: Address,
         recipient: Address,
+        agent: Address,
         amount: i128,
+        payout_confirmed: bool,
     ) -> u64 {
         if amount <= 0 {
             panic!("amount must be positive");
@@ -422,6 +508,10 @@ impl DisputeResolutionContract {
             resolved_for_recipient: false,
         };
         env.storage().persistent().set(&DataKey::Dispute(id), &dispute);
+        env.storage().persistent().set(&DataKey::DisputeAgent(id), &agent);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PayoutConfirmed(id), &payout_confirmed);
 
         let total_disputes: u64 = env
             .storage()
@@ -432,8 +522,8 @@ impl DisputeResolutionContract {
             .persistent()
             .set(&DataKey::TotalDisputes, &(total_disputes + 1));
 
-        // Index the dispute under both parties for pagination.
-        for user in [sender.clone(), recipient.clone()] {
+        // Index the dispute under all three parties for pagination.
+        for user in [sender.clone(), recipient.clone(), agent.clone()] {
             let mut user_disputes: Vec<u64> = env
                 .storage()
                 .persistent()
@@ -458,13 +548,22 @@ impl DisputeResolutionContract {
                 deadline,
             },
         );
+        env.events().publish(
+            (Symbol::new(&env, "EscrowDisputeOpened"),),
+            EvtEscrowDisputeOpened {
+                dispute_id: id,
+                agent,
+                payout_confirmed,
+            },
+        );
 
         id
     }
 
     /// Submit evidence for an open dispute.
     ///
-    /// Only the sender or recipient of the dispute may submit evidence.
+    /// Only the sender or recipient of the dispute — or, for escrow disputes,
+    /// the payout agent — may submit evidence.
     /// Evidence is an IPFS CID or hash (max 256 bytes). Calling again
     /// overwrites the previous submission for that party.
     ///
@@ -501,6 +600,10 @@ impl DisputeResolutionContract {
             dispute.sender_evidence = evidence;
         } else if submitter == dispute.recipient {
             dispute.recipient_evidence = evidence;
+        } else if dispute_agent(&env, dispute_id) == Some(submitter.clone()) {
+            env.storage()
+                .persistent()
+                .set(&DataKey::AgentEvidence(dispute_id), &evidence);
         } else {
             panic!("submitter is not a party to this dispute");
         }
@@ -537,6 +640,21 @@ impl DisputeResolutionContract {
         dispute_id: u64,
         release_to_recipient: bool,
     ) {
+        let ruling = if release_to_recipient {
+            Ruling::Recipient
+        } else {
+            Ruling::Sender
+        };
+        Self::resolve_with(&env, arbitrator, dispute_id, ruling);
+    }
+
+    /// Resolve an escrow dispute in favour of the payout agent, opening the
+    /// same 24-hour appeal window as [`resolve_dispute`]. Arbitrator only.
+    pub fn resolve_dispute_for_agent(env: Env, arbitrator: Address, dispute_id: u64) {
+        Self::resolve_with(&env, arbitrator, dispute_id, Ruling::Agent);
+    }
+
+    fn resolve_with(env: &Env, arbitrator: Address, dispute_id: u64, ruling: Ruling) {
         arbitrator.require_auth();
 
         let stored_arbitrator: Address = env
@@ -561,7 +679,7 @@ impl DisputeResolutionContract {
 
         let now = env.ledger().timestamp();
         dispute.status = DisputeStatus::Appealing;
-        dispute.resolved_for_recipient = release_to_recipient;
+        record_ruling(env, &mut dispute, ruling);
         dispute.appeal_deadline = now + APPEAL_WINDOW_SECS;
 
         env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
@@ -569,7 +687,8 @@ impl DisputeResolutionContract {
 
     /// File an appeal within the 24-hour window after the arbitrator's decision.
     ///
-    /// Only the sender or recipient of the dispute may appeal. A second call
+    /// Only the sender or recipient of the dispute — or, for escrow disputes,
+    /// the payout agent — may appeal. A second call
     /// on the same dispute panics — only one appeal per dispute is allowed.
     /// The dispute transitions to `UnderAppeal` status and the super-arbitrator
     /// must call [`resolve_appeal`] to issue the final binding decision.
@@ -595,7 +714,10 @@ impl DisputeResolutionContract {
         if env.ledger().timestamp() > dispute.appeal_deadline {
             panic!("appeal window has closed");
         }
-        if caller != dispute.sender && caller != dispute.recipient {
+        if caller != dispute.sender
+            && caller != dispute.recipient
+            && dispute_agent(&env, dispute_id) != Some(caller.clone())
+        {
             panic!("caller is not a party to this dispute");
         }
 
@@ -633,31 +755,46 @@ impl DisputeResolutionContract {
             panic!("appeal window has not yet closed");
         }
 
+        let ruling = pending_ruling(&env, &dispute);
+        Self::award(&env, dispute, ruling);
+    }
+
+    /// Pay the disputed funds to the party chosen by `ruling`, mark the
+    /// dispute resolved, settle the filing fee, and emit `DisputeResolved`.
+    fn award(env: &Env, mut dispute: Dispute, ruling: Ruling) {
+        let dispute_id = dispute.id;
         let usdc: Address = env
             .storage()
             .persistent()
             .get(&DataKey::UsdcAddress)
             .unwrap();
 
-        let winner = if dispute.resolved_for_recipient {
-            dispute.status = DisputeStatus::ResolvedForRecipient;
-            dispute.recipient.clone()
-        } else {
-            dispute.status = DisputeStatus::ResolvedForSender;
-            dispute.sender.clone()
+        let winner = match ruling {
+            Ruling::Recipient => {
+                dispute.status = DisputeStatus::ResolvedForRecipient;
+                dispute.recipient.clone()
+            }
+            Ruling::Sender => {
+                dispute.status = DisputeStatus::ResolvedForSender;
+                dispute.sender.clone()
+            }
+            Ruling::Agent => {
+                dispute.status = DisputeStatus::ResolvedForAgent;
+                dispute_agent(env, dispute_id).expect("dispute has no agent")
+            }
         };
 
-        Self::settle_filing_fee(&env, dispute_id, &winner, &usdc);
-        token::Client::new(&env, &usdc).transfer(
+        env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
+
+        Self::settle_filing_fee(env, dispute_id, &winner, &usdc);
+        token::Client::new(env, &usdc).transfer(
             &env.current_contract_address(),
             &winner,
             &dispute.amount,
         );
 
-        env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
-
         env.events().publish(
-            (Symbol::new(&env, "DisputeResolved"),),
+            (Symbol::new(env, "DisputeResolved"),),
             EvtDisputeResolved {
                 dispute_id,
                 winner,
@@ -681,6 +818,21 @@ impl DisputeResolutionContract {
         dispute_id: u64,
         release_to_recipient: bool,
     ) {
+        let ruling = if release_to_recipient {
+            Ruling::Recipient
+        } else {
+            Ruling::Sender
+        };
+        Self::resolve_appeal_with(&env, super_arbitrator, dispute_id, ruling);
+    }
+
+    /// Final binding decision on an appealed escrow dispute in favour of the
+    /// payout agent. Super-arbitrator only.
+    pub fn resolve_appeal_for_agent(env: Env, super_arbitrator: Address, dispute_id: u64) {
+        Self::resolve_appeal_with(&env, super_arbitrator, dispute_id, Ruling::Agent);
+    }
+
+    fn resolve_appeal_with(env: &Env, super_arbitrator: Address, dispute_id: u64, ruling: Ruling) {
         super_arbitrator.require_auth();
 
         let stored_super: Address = env
@@ -703,48 +855,23 @@ impl DisputeResolutionContract {
             panic!("dispute is not under appeal");
         }
 
-        let usdc: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UsdcAddress)
-            .unwrap();
-
-        let winner = if release_to_recipient {
-            dispute.status = DisputeStatus::ResolvedForRecipient;
-            dispute.recipient.clone()
-        } else {
-            dispute.status = DisputeStatus::ResolvedForSender;
-            dispute.sender.clone()
-        };
-
-        Self::settle_filing_fee(&env, dispute_id, &winner, &usdc);
-        token::Client::new(&env, &usdc).transfer(
-            &env.current_contract_address(),
-            &winner,
-            &dispute.amount,
-        );
-
-        env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
-
-        env.events().publish(
-            (Symbol::new(&env, "DisputeResolved"),),
-            EvtDisputeResolved {
-                dispute_id,
-                winner,
-                amount: dispute.amount,
-            },
-        );
+        record_ruling(env, &mut dispute, ruling);
+        Self::award(env, dispute, ruling);
     }
 
-    /// Claim funds back after the 7-day deadline has elapsed without resolution.
+    /// Claim the locked funds after the 7-day deadline has elapsed without
+    /// resolution.
     ///
-    /// Only the original sender may call this. Refunds the full locked amount.
+    /// Normally only the original sender may call this, and the full locked
+    /// amount is refunded to them. For an escrow dispute opened after the agent
+    /// confirmed delivery, the agent's confirmation stands by default: only the
+    /// agent may claim, and the funds go to the agent.
     ///
     /// # Arguments
-    /// * `sender`     — Must match the sender recorded in the dispute.
+    /// * `claimant`   — The sender, or the agent for payout-confirmed escrow disputes.
     /// * `dispute_id` — ID returned by `open_dispute`.
-    pub fn claim_expired(env: Env, sender: Address, dispute_id: u64) {
-        sender.require_auth();
+    pub fn claim_expired(env: Env, claimant: Address, dispute_id: u64) {
+        claimant.require_auth();
 
         let mut dispute: Dispute = env
             .storage()
@@ -752,7 +879,13 @@ impl DisputeResolutionContract {
             .get(&DataKey::Dispute(dispute_id))
             .expect("dispute not found");
 
-        if sender != dispute.sender {
+        let agent = dispute_agent(&env, dispute_id);
+        let pays_agent = payout_confirmed(&env, dispute_id) && agent.is_some();
+        if pays_agent {
+            if Some(claimant.clone()) != agent {
+                panic!("unauthorized: caller is not the dispute agent");
+            }
+        } else if claimant != dispute.sender {
             panic!("unauthorized: caller is not the dispute sender");
         }
         if dispute.status != DisputeStatus::Open {
@@ -768,23 +901,34 @@ impl DisputeResolutionContract {
             .get(&DataKey::UsdcAddress)
             .unwrap();
 
-        token::Client::new(&env, &usdc).transfer(
-            &env.current_contract_address(),
-            &dispute.sender,
-            &dispute.amount,
-        );
-
         dispute.status = DisputeStatus::Expired;
         env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
 
-        env.events().publish(
-            (Symbol::new(&env, "DisputeExpired"),),
-            EvtDisputeExpired {
-                dispute_id,
-                sender: dispute.sender.clone(),
-                refund_amount: dispute.amount,
-            },
+        token::Client::new(&env, &usdc).transfer(
+            &env.current_contract_address(),
+            &claimant,
+            &dispute.amount,
         );
+
+        if pays_agent {
+            env.events().publish(
+                (Symbol::new(&env, "DisputeExpiredToAgent"),),
+                EvtDisputeExpiredToAgent {
+                    dispute_id,
+                    agent: claimant,
+                    amount: dispute.amount,
+                },
+            );
+        } else {
+            env.events().publish(
+                (Symbol::new(&env, "DisputeExpired"),),
+                EvtDisputeExpired {
+                    dispute_id,
+                    sender: dispute.sender.clone(),
+                    refund_amount: dispute.amount,
+                },
+            );
+        }
     }
 
     /// Update the filing fee required to open a dispute. Admin only.
@@ -854,6 +998,24 @@ impl DisputeResolutionContract {
             .persistent()
             .get(&DataKey::Dispute(dispute_id))
             .expect("dispute not found")
+    }
+
+    /// Payout agent of an escrow dispute, or `None` for free-form disputes.
+    pub fn get_dispute_agent(env: Env, dispute_id: u64) -> Option<Address> {
+        dispute_agent(&env, dispute_id)
+    }
+
+    /// Whether the agent had confirmed delivery before the escrow dispute opened.
+    pub fn is_payout_confirmed(env: Env, dispute_id: u64) -> bool {
+        payout_confirmed(&env, dispute_id)
+    }
+
+    /// Evidence submitted by the agent of an escrow dispute (empty if none).
+    pub fn get_agent_evidence(env: Env, dispute_id: u64) -> Bytes {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AgentEvidence(dispute_id))
+            .unwrap_or_else(|| Bytes::new(&env))
     }
 
     /// Step 1 of two-step arbitrator handoff. Admin proposes a new arbitrator.

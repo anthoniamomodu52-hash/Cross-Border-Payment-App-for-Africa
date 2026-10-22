@@ -508,12 +508,18 @@ Signature:
 fn dispute_escrow(env: Env, caller: Address, escrow_id: u64) -> u64
 ```
 
-Escalates a pending escrow to the configured dispute-resolution contract. Only
-the **sender** or **recipient** may call (auth required). The full remaining
+Escalates a pending escrow to the configured dispute-resolution contract. The
+**sender** or **recipient** may call (auth required) — but once the agent has
+called `confirm_delivery`, only the **recipient** may, which stops a sender from
+reclaiming funds after the agent has paid out fiat (#1366). The full remaining
 balance is transferred to the dispute-resolution contract, which records a
 dispute and takes custody of the funds; the escrow is marked `UnderDispute`
 and can no longer be released, cancelled, deposited into, or expired. The
 adjudicated winner is paid directly by the dispute-resolution contract.
+
+The agent is registered as a dispute party: it can submit evidence, appeal, and
+be awarded the funds. If the agent had confirmed delivery and the dispute
+expires unresolved, the agent (not the sender) claims the funds.
 
 Returns the dispute ID assigned by the dispute-resolution contract.
 
@@ -522,6 +528,7 @@ Panics / Errors:
 - `Escrow {id} not found` if the escrow does not exist.
 - `Only the sender or recipient can dispute escrow` if the caller is neither.
 - `Escrow is not in pending state` if the escrow is no longer pending.
+- `Delivery confirmed: only the recipient can dispute` if the sender calls after `confirm_delivery`.
 
 Events:
 - `EscrowDisputed`
@@ -595,7 +602,9 @@ Fields:
 - `escrow_id` (`u64`) - escrow identifier.
 - `dispute_id` (`u64`) - dispute ID assigned by the dispute-resolution contract.
 - `opener` (`Address`) - sender or recipient who escalated the escrow.
+- `agent` (`Address`) - payout agent, registered as a dispute party.
 - `amount` (`i128`) - balance handed over to the dispute-resolution contract.
+- `payout_confirmed` (`bool`) - whether the agent had confirmed delivery.
 
 ### `PartialRelease`
 
